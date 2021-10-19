@@ -1,0 +1,103 @@
+warning: field is never read: `vreg`
+  --> /home/adam/experiments/regalloc.rs/lib/src/snapshot.rs:20:13
+   |
+20 |     Spill { vreg: Option<VirtualReg> },
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: field is never read: `vreg`
+  --> /home/adam/experiments/regalloc.rs/lib/src/snapshot.rs:21:14
+   |
+21 |     Reload { vreg: Option<VirtualReg> },
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field is never read: `vreg`
+  --> /home/adam/experiments/regalloc.rs/lib/src/snapshot.rs:22:12
+   |
+22 |     Move { vreg: VirtualReg },
+   |            ^^^^^^^^^^^^^^^^
+
+warning: `regalloc` (lib) generated 3 warnings
+    Finished release [optimized] target(s) in 0.31s
+     Running `target/release/wasmtime compile loops_small.wat`
+ TRACE regalloc::analysis_control_flow >     CFGInfo::create: begin
+ TRACE regalloc::analysis_control_flow >       calc_preds_and_succs: begin
+ TRACE regalloc::analysis_control_flow > 
+ TRACE regalloc::analysis_control_flow > b0   preds {}  succs {b1}
+ TRACE regalloc::analysis_control_flow > b1   preds {b0}  succs {b2}
+ TRACE regalloc::analysis_control_flow > b2   preds {b1}  succs {b3}
+ TRACE regalloc::analysis_control_flow > b3   preds {b2}  succs {b4}
+ TRACE regalloc::analysis_control_flow > b4   preds {b3}  succs {b5}
+ TRACE regalloc::analysis_control_flow > b5   preds {b4}  succs {b6}
+ TRACE regalloc::analysis_control_flow > b6   preds {b5}  succs {b7}
+ TRACE regalloc::analysis_control_flow > b7   preds {b6}  succs {b8}
+ TRACE regalloc::analysis_control_flow > b8   preds {b7}  succs {b9}
+ TRACE regalloc::analysis_control_flow > b9   preds {b8}  succs {b10}
+ TRACE regalloc::analysis_control_flow > b10   preds {b9}  succs {b11}
+ TRACE regalloc::analysis_control_flow > b11   preds {b10}  succs {b12}
+ TRACE regalloc::analysis_control_flow > b12   preds {b11}  succs {b13}
+ TRACE regalloc::analysis_control_flow > b13   preds {b12}  succs {b14}
+ TRACE regalloc::analysis_control_flow > b14   preds {b13}  succs {b15}
+ TRACE regalloc::analysis_control_flow > b15   preds {b14}  succs {b16}
+ TRACE regalloc::analysis_control_flow > b16   preds {b15}  succs {b17}
+ TRACE regalloc::analysis_control_flow > b17   preds {b16}  succs {b18}
+ TRACE regalloc::analysis_control_flow > b18   preds {b17}  succs {b19}
+ TRACE regalloc::analysis_control_flow > b19   preds {b18}  succs {b20}
+ TRACE regalloc::analysis_control_flow > b20   preds {b19}  succs {b21}
+ TRACE regalloc::analysis_control_flow > b21   preds {b20}  succs {}
+ TRACE regalloc::analysis_control_flow >       calc_preds_and_succs: end
+ TRACE regalloc::analysis_control_flow >       calc_preord_and_postord: begin
+ TRACE regalloc::analysis_control_flow >       calc_preord_and_postord: end.  22 blocks
+ TRACE regalloc::analysis_control_flow >       calc_loop_depths: begin
+ TRACE regalloc::analysis_control_flow >         calc_dom_tree: begin
+ TRACE regalloc::analysis_control_flow >         calc_dom_tree: end
+ TRACE regalloc::analysis_control_flow > 
+ TRACE regalloc::analysis_control_flow > b0   depth 0   idom b0
+ TRACE regalloc::analysis_control_flow > b1   depth 0   idom b0
+ TRACE regalloc::analysis_control_flow > b2   depth 0   idom b1
+ TRACE regalloc::analysis_control_flow > b3   depth 0   idom b2
+ TRACE regalloc::analysis_control_flow > b4   depth 0   idom b3
+ TRACE regalloc::analysis_control_flow > b5   depth 0   idom b4
+ TRACE regalloc::analysis_control_flow > b6   depth 0   idom b5
+ TRACE regalloc::analysis_control_flow > b7   depth 0   idom b6
+ TRACE regalloc::analysis_control_flow > b8   depth 0   idom b7
+ TRACE regalloc::analysis_control_flow > b9   depth 0   idom b8
+ TRACE regalloc::analysis_control_flow > b10   depth 0   idom b9
+ TRACE regalloc::analysis_control_flow > b11   depth 0   idom b10
+ TRACE regalloc::analysis_control_flow > b12   depth 0   idom b11
+ TRACE regalloc::analysis_control_flow > b13   depth 0   idom b12
+ TRACE regalloc::analysis_control_flow > b14   depth 0   idom b13
+ TRACE regalloc::analysis_control_flow > b15   depth 0   idom b14
+ TRACE regalloc::analysis_control_flow > b16   depth 0   idom b15
+ TRACE regalloc::analysis_control_flow > b17   depth 0   idom b16
+ TRACE regalloc::analysis_control_flow > b18   depth 0   idom b17
+ TRACE regalloc::analysis_control_flow > b19   depth 0   idom b18
+ TRACE regalloc::analysis_control_flow > b20   depth 0   idom b19
+ TRACE regalloc::analysis_control_flow > b21   depth 0   idom b20
+ TRACE regalloc::analysis_control_flow >       calc_loop_depths: end
+ TRACE regalloc::analysis_control_flow >     CFGInfo::create: end
+ DEBUG wasmtime_cranelift::compiler    > FuncIndex(0) translated in 551.262µs
+ TRACE wasmtime_cranelift::compiler    > FuncIndex(0) timing info
+======== ========  ==================================
+   Total     Self  Pass
+-------- --------  ----------------------------------
+   0.000    0.000  Translate WASM function
+   0.000    0.000  Compilation passes
+   0.000    0.000  Control flow graph
+   0.000    0.000  Dominator tree
+   0.000    0.000  Loop analysis
+   0.000    0.000  Pre-legalization rewriting
+   0.000    0.000  Dead code elimination
+   0.000    0.000  Global value numbering
+   0.000    0.000  Loop invariant code motion
+   0.000    0.000  Remove unreachable blocks
+   0.000    0.000  Remove constant phi-nodes
+   0.000    0.000  VCode lowering
+   0.000    0.000  VCode post-register allocation finalization
+   0.000    0.000  VCode emission
+   0.000    0.000  VCode emission finalization
+   0.000    0.000  Register allocation
+   0.000    0.000  Binary machine code emission
+======== ========  ==================================
+
