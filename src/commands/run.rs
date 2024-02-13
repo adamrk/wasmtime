@@ -5,17 +5,17 @@
     allow(irrefutable_let_patterns, unreachable_patterns)
 )]
 
-use crate::common::Profile;
-
 use anyhow::{anyhow, bail, Context as _, Error, Result};
 use clap::Parser;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 use wasmtime::{
     Engine, Func, Module, Precompiled, Store, StoreLimits, StoreLimitsBuilder, Val, ValType,
 };
+use wasmtime_cli_flags::opt::WasmtimeOptionValue;
 use wasmtime_cli_flags::CommonOptions;
 use wasmtime_wasi::maybe_exit_on_error;
 use wasmtime_wasi::preview2;
@@ -93,7 +93,7 @@ pub struct RunCommon {
         value_name = "STRATEGY",
         value_parser = Profile::parse,
     )]
-    pub profile: Option<Profile>,
+    pub(crate) profile: Option<Profile>,
 }
 
 impl RunCommon {
@@ -237,6 +237,37 @@ impl RunCommon {
                 }
             }
         })
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) enum Profile {
+    Native(wasmtime::ProfilingStrategy),
+    Guest { path: String, interval: Duration },
+}
+
+impl Profile {
+    /// Parse the `profile` argument to either the `run` or `serve` commands.
+    fn parse(s: &str) -> Result<Profile> {
+        let parts = s.split(',').collect::<Vec<_>>();
+        match &parts[..] {
+            ["perfmap"] => Ok(Profile::Native(wasmtime::ProfilingStrategy::PerfMap)),
+            ["jitdump"] => Ok(Profile::Native(wasmtime::ProfilingStrategy::JitDump)),
+            ["vtune"] => Ok(Profile::Native(wasmtime::ProfilingStrategy::VTune)),
+            ["guest"] => Ok(Profile::Guest {
+                path: "wasmtime-guest-profile.json".to_string(),
+                interval: Duration::from_millis(10),
+            }),
+            ["guest", path] => Ok(Profile::Guest {
+                path: path.to_string(),
+                interval: Duration::from_millis(10),
+            }),
+            ["guest", path, dur] => Ok(Profile::Guest {
+                path: path.to_string(),
+                interval: WasmtimeOptionValue::parse(Some(dur))?,
+            }),
+            _ => bail!("unknown profiling strategy: {s}"),
+        }
     }
 }
 

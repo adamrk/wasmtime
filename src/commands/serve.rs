@@ -1,5 +1,4 @@
-use crate::commands::run::{RunCommon, RunTarget};
-use crate::common::Profile;
+use crate::commands::run::{Profile, RunCommon, RunTarget};
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use std::net::SocketAddr;
