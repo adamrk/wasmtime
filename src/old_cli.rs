@@ -812,7 +812,7 @@ impl RunCommand {
             dirs.push((host, guest));
         }
 
-        let run = crate::common::RunCommon {
+        let run = crate::commands::RunCommon {
             common,
             allow_precompiled,
             profile: profile.map(|p| p.convert()),
