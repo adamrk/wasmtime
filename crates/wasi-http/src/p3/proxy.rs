@@ -11,24 +11,26 @@ impl Service {
         store: &Accessor<impl WasiHttpView>,
         req: impl Into<Request>,
     ) -> wasmtime::Result<Result<Response, ErrorCode>> {
-        let req = store.with(|mut store| {
+        let req = store.with2(|mut store| {
             store
                 .data_mut()
                 .http()
                 .table
                 .push(req.into())
                 .context("failed to push request to table")
-        })?;
+        })
+        .await?;
         match self.wasi_http_handler().call_handle(store, req).await? {
             Ok(res) => {
-                let res = store.with(|mut store| {
+                let res = store.with2(|mut store| {
                     store
                         .data_mut()
                         .http()
                         .table
                         .delete(res)
                         .context("failed to delete response from table")
-                })?;
+                })
+                .await?;
                 Ok(Ok(res))
             }
             Err(err) => Ok(Err(err)),

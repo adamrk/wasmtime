@@ -470,6 +470,16 @@ where
         })
     }
 
+    /// Temporary version of [`with`] to be used in async context.
+    pub async fn with2<R>(&self, fun: impl FnOnce(Access<'_, T, D>) -> R) -> R {
+        tls::get(|vmstore| {
+            fun(Access {
+                store: self.token.as_context_mut(vmstore),
+                get_data: self.get_data,
+            })
+        })
+    }
+
     /// Returns the getter this accessor is using to project from `T` into
     /// `D::Data`.
     pub fn getter(&self) -> fn(&mut T) -> D::Data<'_> {
@@ -517,12 +527,13 @@ where
     /// Panics if called within a closure provided to the [`Accessor::with`]
     /// function. This can only be called outside an active invocation of
     /// [`Accessor::with`].
-    pub fn spawn(&self, task: impl AccessorTask<T, D>) -> Result<JoinHandle>
+    pub async fn spawn(&self, task: impl AccessorTask<T, D>) -> Result<JoinHandle>
     where
         T: 'static,
     {
         let accessor = self.clone_for_spawn();
-        self.with(|mut access| access.as_context_mut().spawn_with_accessor(accessor, task))
+        self.with2(|mut access| access.as_context_mut().spawn_with_accessor(accessor, task))
+            .await
     }
 
     fn clone_for_spawn(&self) -> Self {
@@ -1174,9 +1185,9 @@ impl<T> StoreContextMut<'_, T> {
     /// # let foo = instance.get_typed_func::<(Resource<MyResource>,), (Resource<MyResource>,)>(&mut store, "foo")?;
     /// # let bar = instance.get_typed_func::<(u32,), ()>(&mut store, "bar")?;
     /// store.run_concurrent(async |accessor| -> wasmtime::Result<_> {
-    ///    let resource = accessor.with(|mut access| access.get().table.push(MyResource(42)))?;
+    ///    let resource = accessor.with2(|mut access| access.get().table.push(MyResource(42))).await?;
     ///    let (another_resource,) = foo.call_concurrent(accessor, (resource,)).await?;
-    ///    let value = accessor.with(|mut access| access.get().table.delete(another_resource))?;
+    ///    let value = accessor.with2(|mut access| access.get().table.delete(another_resource)).await?;
     ///    bar.call_concurrent(accessor, (value.0,)).await?;
     ///    Ok(())
     /// }).await??;

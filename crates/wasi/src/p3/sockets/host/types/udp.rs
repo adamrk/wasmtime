@@ -36,10 +36,11 @@ impl<T> HostUdpSocketWithStore<T> for WasiSockets {
         remote_address: Option<IpSocketAddress>,
     ) -> SocketResult<()> {
         store
-            .with(|mut view| -> SocketResult<_> {
+            .with2(|mut view| -> SocketResult<_> {
                 let socket = get_socket_mut(view.get().table, &socket)?;
                 Ok(socket.send(data, remote_address.map(SocketAddr::from)))
-            })?
+            })
+            .await?
             .await?;
         Ok(())
     }
@@ -49,10 +50,11 @@ impl<T> HostUdpSocketWithStore<T> for WasiSockets {
         socket: Resource<UdpSocket>,
     ) -> SocketResult<(Vec<u8>, IpSocketAddress)> {
         let (data, addr) = store
-            .with(|mut view| -> SocketResult<_> {
+            .with2(|mut view| -> SocketResult<_> {
                 let socket = get_socket_mut(view.get().table, &socket)?;
                 Ok(socket.recv())
-            })?
+            })
+            .await?
             .await?;
         Ok((data, addr.into()))
     }

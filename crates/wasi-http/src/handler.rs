@@ -1078,10 +1078,12 @@ impl<'a, T: Send> Prepared<'a, T> {
                         .await?
                         .0?;
 
-                    accessor.with(|mut store| {
-                        let response = view(store.get()).table.delete(response)?;
-                        response.into_http_with_getter(&mut store, request_io_result, view)
-                    })
+                    accessor
+                        .with2(|mut store| {
+                            let response = view(store.get()).table.delete(response)?;
+                            response.into_http_with_getter(&mut store, request_io_result, view)
+                        })
+                        .await
                 });
 
                 // TODO: We should also use `oneshot::Sender::poll_close` to be

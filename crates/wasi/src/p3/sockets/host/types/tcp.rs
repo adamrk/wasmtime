@@ -207,11 +207,13 @@ impl<T: Send> HostTcpSocketWithStore<T> for WasiSockets {
     ) -> SocketResult<()> {
         let remote_address = SocketAddr::from(remote_address);
 
-        store.with(|mut store| {
-            let socket = get_socket_mut(store.get().table, &socket)?;
-            let socket = socket.start_connect(remote_address)?;
-            SocketResult::Ok(socket)
-        })?;
+        store
+            .with2(|mut store| {
+                let socket = get_socket_mut(store.get().table, &socket)?;
+                let socket = socket.start_connect(remote_address)?;
+                SocketResult::Ok(socket)
+            })
+            .await?;
 
         std::future::poll_fn(|cx| {
             store.with(|mut store| -> Poll<SocketResult<()>> {

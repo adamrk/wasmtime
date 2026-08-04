@@ -175,7 +175,9 @@ async fn run_http<E: Into<Error> + 'static>(
                         Ok(res) => res,
                         Err(err) => return Ok(Err(Some(err))),
                     };
-                    let res = store.with(|store| res.into_http(store, async { Ok(()) }))?;
+                    let res = store
+                        .with2(|store| res.into_http(store, async { Ok(()) }))
+                        .await?;
                     let (parts, body) = res.into_parts();
                     let body = body.collect().await.context("failed to collect body")?;
                     wasmtime::error::Ok(Ok(http::Response::from_parts(parts, body)))
