@@ -1425,20 +1425,39 @@ impl<T> FutureReader<T> {
     }
 
     /// Convenience method around [`Self::close`].
-    pub fn close_with(&mut self, accessor: impl AsAccessor) -> Result<()> {
-        accessor.as_accessor().with(|access| self.close(access))
+    pub async fn close_with(&mut self, accessor: impl AsAccessor) -> Result<()> {
+        accessor
+            .as_accessor()
+            .with2(|access| self.close(access))
+            .await
     }
 
-    /// Returns a [`GuardedFutureReader`] which will auto-close this future on
-    /// drop and clean it up from the store.
+    /// Run the specified closure on this `FutureReader` and ensure it is
+    /// dropped upon completion.
     ///
-    /// Note that the `accessor` provided must own this future and is
-    /// additionally transferred to the `GuardedFutureReader` return value.
-    pub fn guard<A>(self, accessor: A) -> GuardedFutureReader<T, A>
+    /// Note that the `accessor` provided must own this future.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`Config::concurrency_support`] is not enabled.
+    ///
+    /// [`Config::concurrency_support`]: crate::Config::concurrency_support
+    pub async fn run<A, R>(mut self, accessor: A, f: impl AsyncFnOnce(&mut Self) -> R) -> R
     where
         A: AsAccessor,
     {
-        GuardedFutureReader::new(accessor, self)
+        assert!(
+            accessor
+                .as_accessor()
+                .with2(|a| a.as_context().0.concurrency_support())
+                .await
+        );
+        let result = f(&mut self).await;
+        let close_result = self.close_with(accessor).await;
+        // This can only fail if the future is closed twice, which this method
+        // prevents because it takes ownership of `self`.
+        debug_assert!(close_result.is_ok());
+        result
     }
 
     /// Attempts to convert this [`FutureReader<T>`] to a [`FutureAny`].
@@ -1578,77 +1597,6 @@ unsafe impl<T: ComponentType> func::Lift for FutureReader<T> {
     }
 }
 
-/// A [`FutureReader`] paired with an [`Accessor`].
-///
-/// This is an RAII wrapper around [`FutureReader`] that ensures it is closed
-/// when dropped. This can be created through [`GuardedFutureReader::new`] or
-/// [`FutureReader::guard`].
-///
-/// [`Accessor`]: crate::component::Accessor
-pub struct GuardedFutureReader<T, A>
-where
-    A: AsAccessor,
-{
-    // This field is `None` to implement the conversion from this guard back to
-    // `FutureReader`. When `None` is seen in the destructor it will cause the
-    // destructor to do nothing.
-    reader: Option<FutureReader<T>>,
-    accessor: A,
-}
-
-impl<T, A> GuardedFutureReader<T, A>
-where
-    A: AsAccessor,
-{
-    /// Create a new `GuardedFutureReader` with the specified `accessor` and `reader`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if [`Config::concurrency_support`] is not enabled.
-    ///
-    /// [`Config::concurrency_support`]: crate::Config::concurrency_support
-    pub fn new(accessor: A, reader: FutureReader<T>) -> Self {
-        assert!(
-            accessor
-                .as_accessor()
-                .with(|a| a.as_context().0.concurrency_support())
-        );
-        Self {
-            reader: Some(reader),
-            accessor,
-        }
-    }
-
-    /// Extracts the underlying [`FutureReader`] from this guard, returning it
-    /// back.
-    pub fn into_future(self) -> FutureReader<T> {
-        self.into()
-    }
-}
-
-impl<T, A> From<GuardedFutureReader<T, A>> for FutureReader<T>
-where
-    A: AsAccessor,
-{
-    fn from(mut guard: GuardedFutureReader<T, A>) -> Self {
-        guard.reader.take().unwrap()
-    }
-}
-
-impl<T, A> Drop for GuardedFutureReader<T, A>
-where
-    A: AsAccessor,
-{
-    fn drop(&mut self) {
-        if let Some(reader) = &mut self.reader {
-            // Currently this can only fail if the future is closed twice, which
-            // this guard prevents, so this error shouldn't happen.
-            let result = reader.close_with(&self.accessor);
-            debug_assert!(result.is_ok());
-        }
-    }
-}
-
 /// Represents the readable end of a Component Model `stream`.
 ///
 /// Note that `StreamReader` instances must be disposed of using `close`;
@@ -1784,20 +1732,39 @@ impl<T> StreamReader<T> {
     }
 
     /// Convenience method around [`Self::close`].
-    pub fn close_with(&mut self, accessor: impl AsAccessor) -> Result<()> {
-        accessor.as_accessor().with(|access| self.close(access))
+    pub async fn close_with(&mut self, accessor: impl AsAccessor) -> Result<()> {
+        accessor
+            .as_accessor()
+            .with2(|access| self.close(access))
+            .await
     }
 
-    /// Returns a [`GuardedStreamReader`] which will auto-close this stream on
-    /// drop and clean it up from the store.
+    /// Run the specified closure on this `StreamReader` and ensure it is
+    /// dropped upon completion.
     ///
-    /// Note that the `accessor` provided must own this future and is
-    /// additionally transferred to the `GuardedStreamReader` return value.
-    pub fn guard<A>(self, accessor: A) -> GuardedStreamReader<T, A>
+    /// Note that the `accessor` provided must own this future.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`Config::concurrency_support`] is not enabled.
+    ///
+    /// [`Config::concurrency_support`]: crate::Config::concurrency_support
+    pub async fn run<A, R>(mut self, accessor: A, f: impl AsyncFnOnce(&mut Self) -> R) -> R
     where
         A: AsAccessor,
     {
-        GuardedStreamReader::new(accessor, self)
+        assert!(
+            accessor
+                .as_accessor()
+                .with2(|a| a.as_context().0.concurrency_support())
+                .await
+        );
+        let result = f(&mut self).await;
+        let close_result = self.close_with(accessor).await;
+        // This can only fail if the future is closed twice, which this method
+        // prevents because it takes ownership of `self`.
+        debug_assert!(close_result.is_ok());
+        result
     }
 
     /// Attempts to convert this [`StreamReader<T>`] to a [`StreamAny`].
@@ -1934,78 +1901,6 @@ unsafe impl<T: ComponentType> func::Lift for StreamReader<T> {
     ) -> Result<Self> {
         let index = u32::linear_lift_from_memory(cx, InterfaceType::U32, bytes)?;
         Self::lift_from_index(cx, ty, index)
-    }
-}
-
-/// A [`StreamReader`] paired with an [`Accessor`].
-///
-/// This is an RAII wrapper around [`StreamReader`] that ensures it is closed
-/// when dropped. This can be created through [`GuardedStreamReader::new`] or
-/// [`StreamReader::guard`].
-///
-/// [`Accessor`]: crate::component::Accessor
-pub struct GuardedStreamReader<T, A>
-where
-    A: AsAccessor,
-{
-    // This field is `None` to implement the conversion from this guard back to
-    // `StreamReader`. When `None` is seen in the destructor it will cause the
-    // destructor to do nothing.
-    reader: Option<StreamReader<T>>,
-    accessor: A,
-}
-
-impl<T, A> GuardedStreamReader<T, A>
-where
-    A: AsAccessor,
-{
-    /// Create a new `GuardedStreamReader` with the specified `accessor` and
-    /// `reader`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if [`Config::concurrency_support`] is not enabled.
-    ///
-    /// [`Config::concurrency_support`]: crate::Config::concurrency_support
-    pub fn new(accessor: A, reader: StreamReader<T>) -> Self {
-        assert!(
-            accessor
-                .as_accessor()
-                .with(|a| a.as_context().0.concurrency_support())
-        );
-        Self {
-            reader: Some(reader),
-            accessor,
-        }
-    }
-
-    /// Extracts the underlying [`StreamReader`] from this guard, returning it
-    /// back.
-    pub fn into_stream(self) -> StreamReader<T> {
-        self.into()
-    }
-}
-
-impl<T, A> From<GuardedStreamReader<T, A>> for StreamReader<T>
-where
-    A: AsAccessor,
-{
-    fn from(mut guard: GuardedStreamReader<T, A>) -> Self {
-        guard.reader.take().unwrap()
-    }
-}
-
-impl<T, A> Drop for GuardedStreamReader<T, A>
-where
-    A: AsAccessor,
-{
-    fn drop(&mut self) {
-        if let Some(reader) = &mut self.reader {
-            // Currently this can only fail if the future is closed twice, which
-            // this guard prevents, so this error shouldn't happen.
-            let result = reader.close_with(&self.accessor);
-            debug_assert!(result.is_ok());
-        }
     }
 }
 

@@ -103,8 +103,8 @@ pub use func::{FuncCallConcurrent, TypedFuncCallConcurrent};
 pub use future_stream_any::{FutureAny, StreamAny};
 pub use futures_and_streams::{
     Destination, DirectDestination, DirectSource, ErrorContext, FutureConsumer, FutureProducer,
-    FutureReader, GuardedFutureReader, GuardedStreamReader, ReadBuffer, Source, StreamConsumer,
-    StreamProducer, StreamReader, StreamResult, VecBuffer, WriteBuffer,
+    FutureReader, ReadBuffer, Source, StreamConsumer, StreamProducer, StreamReader, StreamResult,
+    VecBuffer, WriteBuffer,
 };
 pub(crate) use futures_and_streams::{ResourcePair, lower_error_context_to_index};
 
