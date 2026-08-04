@@ -10,7 +10,6 @@ use crate::block_on;
 use crate::generators::{self, CompilerStrategy, InstanceAllocationStrategy};
 use crate::oracles::log_wasm;
 use arbitrary::{Arbitrary, Unstructured};
-use std::any::Any;
 use std::fmt::Debug;
 use std::ops::ControlFlow;
 use wasmtime::component::{
@@ -264,7 +263,9 @@ where
 {
     crate::init_fuzzing();
 
-    let mut store = store::<Box<dyn Any + Send>>(input, Box::new(()))?;
+    // Store initially holds `None`, but is expected to be `Some` by the time
+    // the imported function is actually called.
+    let mut store = store::<Option<(P, R)>>(input, None)?;
     let engine = store.engine();
     let wat = declarations.make_component();
     let wat = wat.as_bytes();
@@ -273,7 +274,7 @@ where
     let mut linker = Linker::new(&engine);
 
     fn host_function<P, R>(
-        cx: StoreContextMut<'_, Box<dyn Any + Send>>,
+        cx: StoreContextMut<'_, Option<(P, R)>>,
         params: P,
     ) -> wasmtime::Result<R>
     where
@@ -281,7 +282,7 @@ where
         R: Debug + Clone + 'static,
     {
         log::trace!("received parameters {params:?}");
-        let data: &(P, R) = cx.data().downcast_ref().unwrap();
+        let data: &(P, R) = cx.data().as_ref().unwrap();
         let (expected_params, result) = data;
         assert_eq!(params, *expected_params);
         log::trace!("returning result {result:?}");
@@ -293,7 +294,8 @@ where
             .root()
             .func_wrap_concurrent(IMPORT_FUNCTION, |a, params| {
                 Box::pin(async move {
-                    a.with(|mut cx| host_function::<P, R>(cx.as_context_mut(), params))
+                    a.with2(|mut cx| host_function::<P, R>(cx.as_context_mut(), params))
+                        .await
                 })
             })
             .unwrap();
@@ -319,7 +321,7 @@ where
         while iters.next().is_some() && input.arbitrary()? {
             let params = input.arbitrary::<P>()?;
             let result = input.arbitrary::<R>()?;
-            *store.data_mut() = Box::new((params.clone(), result.clone()));
+            *store.data_mut() = Some((params.clone(), result.clone()));
             log::trace!("passing in parameters {params:?}");
             let actual = if declarations.options.guest_caller_async {
                 store
@@ -381,7 +383,8 @@ pub fn dynamic_component_api_target(input: &mut arbitrary::Unstructured) -> arbi
             .func_new_concurrent(IMPORT_FUNCTION, {
                 move |cx: &Accessor<_, _>, _, params: &[Val], results: &mut [Val]| {
                     Box::pin(async move {
-                        cx.with(|mut store| host_function(store.as_context_mut(), params, results))
+                        cx.with2(|mut store| host_function(store.as_context_mut(), params, results))
+                            .await
                     })
                 }
             })
