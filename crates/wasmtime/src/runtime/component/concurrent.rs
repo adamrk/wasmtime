@@ -74,8 +74,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use core::any::Any;
 use core::cell::UnsafeCell;
 use core::fmt;
-use core::future;
-use core::future::Future;
+use core::future::{self, Future};
 use core::marker::PhantomData;
 use core::mem::{self, ManuallyDrop, MaybeUninit};
 use core::ops::DerefMut;
@@ -426,12 +425,8 @@ const _: () = {
 impl<T> Accessor<T> {
     /// Creates a new `Accessor` backed by the specified functions.
     ///
-    /// - `get`: used to retrieve the store
-    ///
     /// - `get_data`: used to "project" from the store's associated data to
     /// another type (e.g. a field of that data or a wrapper around it).
-    ///
-    /// - `spawn`: used to queue spawned background tasks to be run later
     pub(crate) fn new(token: StoreToken<T>) -> Self {
         Self {
             token,
@@ -471,13 +466,14 @@ where
     }
 
     /// Temporary version of [`with`] to be used in async context.
-    pub async fn with2<R>(&self, fun: impl FnOnce(Access<'_, T, D>) -> R) -> R {
-        tls::get(|vmstore| {
+    pub async fn with2<R>(&self, fun: impl FnOnce(Access<'_, T, D>) -> R + Send) -> R {
+        tls::get2(|vmstore| {
             fun(Access {
                 store: self.token.as_context_mut(vmstore),
                 get_data: self.get_data,
             })
         })
+        .await
     }
 
     /// Returns the getter this accessor is using to project from `T` into
@@ -5719,7 +5715,7 @@ fn check_ambient_store(id: StoreId) {
         store to which they belong.  Please use \
         `StoreContextMut::{run_concurrent,spawn}` to poll or await them.\
     ";
-    tls::try_get(|store| {
+    tls::try_get(None, |store| {
         let matched = match store {
             tls::TryGet::Some(store) => store.id() == id,
             tls::TryGet::Taken | tls::TryGet::None => false,
@@ -5734,7 +5730,7 @@ fn check_ambient_store(id: StoreId) {
 /// Assert that `StoreContextMut::run_concurrent` has not been called from
 /// within an store's event loop.
 fn check_recursive_run() {
-    tls::try_get(|store| {
+    tls::try_get(None, |store| {
         if !matches!(store, tls::TryGet::None) {
             panic!("Recursive `StoreContextMut::run_concurrent` calls not supported")
         }

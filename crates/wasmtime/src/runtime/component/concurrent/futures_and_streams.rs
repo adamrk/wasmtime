@@ -1261,7 +1261,10 @@ pub struct FutureReader<T> {
     _phantom: PhantomData<T>,
 }
 
-impl<T> FutureReader<T> {
+impl<T> FutureReader<T>
+where
+    T: Send,
+{
     /// Create a new future with the specified producer.
     ///
     /// # Errors
@@ -1608,7 +1611,10 @@ pub struct StreamReader<T> {
     _phantom: PhantomData<T>,
 }
 
-impl<T> StreamReader<T> {
+impl<T> StreamReader<T>
+where
+    T: Send,
+{
     /// Create a new stream with the specified producer.
     ///
     /// # Errors

@@ -18,8 +18,12 @@
 
 use crate::runtime::vm::VMStore;
 use crate::vm::{component_async_tls_get, component_async_tls_set};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::future::Future;
 use core::mem;
 use core::ptr::NonNull;
+use core::task::{Context, Poll, Waker};
 
 fn tls_get() -> Option<NonNull<SetStorage>> {
     NonNull::new(component_async_tls_get().cast())
@@ -34,7 +38,7 @@ fn tls_set(val: Option<NonNull<SetStorage>>) {
 
 enum SetStorage {
     Present(NonNull<dyn VMStore>),
-    Taken,
+    Taken(Vec<Waker>),
 }
 
 /// Configures `store` to be available for the duration of `f` through calls to
@@ -59,6 +63,31 @@ pub fn set<R>(store: &mut dyn VMStore, f: impl FnOnce() -> R) -> R {
     }
 }
 
+struct GetFuture<'a, R> {
+    f: Option<Box<dyn FnOnce(&mut dyn VMStore) -> R + 'a + Send>>,
+}
+
+impl<'a, R> Future for GetFuture<'a, R> {
+    type Output = R;
+
+    fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let result = try_get(Some(cx.waker().clone()), |val| match val {
+            TryGet::Some(store) => Some((self.f.take().unwrap())(store)),
+            TryGet::None => get_failed(false),
+            TryGet::Taken => None,
+        });
+        match result {
+            Some(r) => Poll::Ready(r),
+            None => Poll::Pending,
+        }
+    }
+}
+
+pub async fn get2<R>(f: impl FnOnce(&mut dyn VMStore) -> R + Send) -> R {
+    let f = Box::new(f);
+    GetFuture { f: Some(f) }.await
+}
+
 /// Acquires a reference to the previous store configured via [`set`] above,
 /// yielding this reference to the closure `f provided here.
 ///
@@ -73,7 +102,7 @@ pub fn set<R>(store: &mut dyn VMStore, f: impl FnOnce() -> R) -> R {
 /// This function will panic if [`set`] has not been previously called or if the
 /// current pointer is taken by a previous call to [`get`] on the stack.
 pub fn get<R>(f: impl FnOnce(&mut dyn VMStore) -> R) -> R {
-    try_get(|val| match val {
+    try_get(None, |val| match val {
         TryGet::Some(store) => f(store),
         TryGet::None => get_failed(false),
         TryGet::Taken => get_failed(true),
@@ -113,7 +142,7 @@ pub enum TryGet<'a> {
 
 /// Same as [`get`] except that this does not panic if `set` has not been
 /// called.
-pub fn try_get<R>(f: impl FnOnce(TryGet<'_>) -> R) -> R {
+pub fn try_get<R>(waker: Option<Waker>, f: impl FnOnce(TryGet<'_>) -> R) -> R {
     // SAFETY: This is The Unsafe Block of this module on which everything
     // hinges. The overall idea is that the pointer previously provided to
     // `set` is passed to the closure here but only at most once because it's
@@ -141,24 +170,48 @@ pub fn try_get<R>(f: impl FnOnce(TryGet<'_>) -> R) -> R {
         let storage = tls_get();
         let _reset;
         let val = match storage {
-            Some(mut storage) => match mem::replace(storage.as_mut(), SetStorage::Taken) {
-                SetStorage::Taken => TryGet::Taken,
-                SetStorage::Present(mut ptr) => {
-                    _reset = ResetStorage(storage, ptr);
-                    TryGet::Some(ptr.as_mut())
+            Some(mut storage) => {
+                match mem::replace(storage.as_mut(), SetStorage::Taken(Vec::new())) {
+                    SetStorage::Taken(mut v) => {
+                        if let Some(waker) = waker {
+                            v.push(waker);
+                        }
+                        _reset = ResetStorage::Taken(storage, v);
+                        TryGet::Taken
+                    }
+                    SetStorage::Present(mut ptr) => {
+                        _reset = ResetStorage::Some(storage, ptr);
+                        TryGet::Some(ptr.as_mut())
+                    }
                 }
-            },
+            }
             None => TryGet::None,
         };
         return f(val);
     }
 
-    struct ResetStorage(NonNull<SetStorage>, NonNull<dyn VMStore>);
+    enum ResetStorage {
+        Some(NonNull<SetStorage>, NonNull<dyn VMStore>),
+        Taken(NonNull<SetStorage>, Vec<Waker>),
+    }
 
     impl Drop for ResetStorage {
         fn drop(&mut self) {
-            unsafe {
-                *self.0.as_mut() = SetStorage::Present(self.1);
+            match self {
+                Self::Some(storage, store) => unsafe {
+                    if let SetStorage::Taken(wakers) =
+                        mem::replace(storage.as_mut(), SetStorage::Present(*store))
+                    {
+                        for waker in wakers {
+                            waker.wake();
+                        }
+                    } else {
+                        panic!("TLS corrupted");
+                    }
+                },
+                Self::Taken(storage, v) => unsafe {
+                    *storage.as_mut() = SetStorage::Taken(v.clone());
+                },
             }
         }
     }
@@ -168,6 +221,10 @@ pub fn try_get<R>(f: impl FnOnce(TryGet<'_>) -> R) -> R {
 mod tests {
     use super::{TryGet, get, set, try_get};
     use crate::{AsContextMut, Engine, Store};
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::Waker;
 
     #[test]
     fn test_simple() {
@@ -176,7 +233,7 @@ mod tests {
 
         set(store.as_context_mut().0, || {
             get(|_| {});
-            try_get(|t| {
+            try_get(None, |t| {
                 assert!(matches!(t, TryGet::Some(_)));
             });
         });
@@ -187,38 +244,38 @@ mod tests {
         let engine = Engine::default();
         let mut store = Store::new(&engine, ());
 
-        try_get(|t| {
+        try_get(None, |t| {
             assert!(matches!(t, TryGet::None));
-            try_get(|t| {
+            try_get(None, |t| {
                 assert!(matches!(t, TryGet::None));
             });
         });
         set(store.as_context_mut().0, || {
             get(|_| {
-                try_get(|t| {
+                try_get(None, |t| {
                     assert!(matches!(t, TryGet::Taken));
-                    try_get(|t| {
+                    try_get(None, |t| {
                         assert!(matches!(t, TryGet::Taken));
                     });
                 });
             });
-            try_get(|t| {
+            try_get(None, |t| {
                 assert!(matches!(t, TryGet::Some(_)));
-                try_get(|t| {
+                try_get(None, |t| {
                     assert!(matches!(t, TryGet::Taken));
-                    try_get(|t| {
+                    try_get(None, |t| {
                         assert!(matches!(t, TryGet::Taken));
                     });
                 });
             });
-            try_get(|t| {
+            try_get(None, |t| {
                 assert!(matches!(t, TryGet::Some(_)));
-                try_get(|t| {
+                try_get(None, |t| {
                     assert!(matches!(t, TryGet::Taken));
                 });
             });
         });
-        try_get(|t| {
+        try_get(None, |t| {
             assert!(matches!(t, TryGet::None));
         });
     }
@@ -236,5 +293,112 @@ mod tests {
                 });
             });
         });
+    }
+
+    /// A [`Waker`] that counts how many times it has been woken.
+    ///
+    /// Used to observe when `try_get` wakes wakers that were registered while
+    /// the store was [`TryGet::Taken`].
+    struct CountingWaker(AtomicUsize);
+
+    impl CountingWaker {
+        fn new() -> Arc<Self> {
+            Arc::new(Self(AtomicUsize::new(0)))
+        }
+
+        /// The number of times this waker has been woken so far.
+        fn count(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A waker registered while the store is taken is woken exactly once when
+    /// the holder of the store releases it, and not a moment before.
+    #[test]
+    fn test_waker_woken_on_release() {
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+
+        let waker = CountingWaker::new();
+
+        set(store.as_context_mut().0, || {
+            get(|_| {
+                // The store is currently held by this `get`, so a `try_get`
+                // that passes a waker observes `Taken` and registers the waker
+                // to be woken on release.
+                try_get(Some(Waker::from(waker.clone())), |t| {
+                    assert!(matches!(t, TryGet::Taken));
+                });
+
+                // The store has not been released yet, so the waker must not
+                // have been woken.
+                assert_eq!(waker.count(), 0);
+            });
+
+            // Returning from `get` released the store, which must have woken the
+            // waker registered above exactly once...
+            assert_eq!(waker.count(), 1);
+
+            // ...and the store is available again.
+            try_get(None, |t| assert!(matches!(t, TryGet::Some(_))));
+        });
+    }
+
+    /// Every waker registered while the store is taken is woken when the store
+    /// is released, not just the first or the last one.
+    #[test]
+    fn test_all_wakers_woken_on_release() {
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+
+        let waker1 = CountingWaker::new();
+        let waker2 = CountingWaker::new();
+
+        set(store.as_context_mut().0, || {
+            get(|_| {
+                try_get(Some(Waker::from(waker1.clone())), |t| {
+                    assert!(matches!(t, TryGet::Taken));
+                });
+                try_get(Some(Waker::from(waker2.clone())), |t| {
+                    assert!(matches!(t, TryGet::Taken));
+                });
+
+                assert_eq!(waker1.count(), 0);
+                assert_eq!(waker2.count(), 0);
+            });
+
+            // Both wakers registered while the store was taken are woken.
+            assert_eq!(waker1.count(), 1);
+            assert_eq!(waker2.count(), 1);
+        });
+    }
+
+    /// When the store is available, `try_get` hands it out directly and a waker
+    /// passed alongside is simply dropped, never registered nor woken.
+    #[test]
+    fn test_waker_ignored_when_store_available() {
+        let engine = Engine::default();
+        let mut store = Store::new(&engine, ());
+
+        let waker = CountingWaker::new();
+
+        set(store.as_context_mut().0, || {
+            try_get(Some(Waker::from(waker.clone())), |t| {
+                assert!(matches!(t, TryGet::Some(_)));
+            });
+        });
+
+        // The waker was dropped unused; it must never have been woken.
+        assert_eq!(waker.count(), 0);
     }
 }
