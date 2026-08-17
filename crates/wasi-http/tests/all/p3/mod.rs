@@ -29,6 +29,12 @@ use wasmtime_wasi_http::{
 
 foreach_p3_http!(assert_test_exists);
 
+#[expect(
+    dead_code,
+    reason = "exercised via the http_latency benchmark, satisfying foreach_p3_http! macro"
+)]
+fn p3_http_proxy_bench() {}
+
 struct TestHooks {
     request_tx: Option<oneshot::Sender<http::Request<WasiBody>>>,
 }

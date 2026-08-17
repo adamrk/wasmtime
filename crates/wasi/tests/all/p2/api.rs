@@ -126,6 +126,12 @@ fn p2_api_proxy_streaming() {}
 )]
 fn p2_api_proxy_forward_request() {}
 
+#[expect(
+    dead_code,
+    reason = "exercised via the http_latency benchmark, satisfying foreach_p2_api! macro"
+)]
+fn p2_api_proxy_bench() {}
+
 wasmtime::component::bindgen!({
     path: "src/p2/wit",
     world: "test-reactor",
