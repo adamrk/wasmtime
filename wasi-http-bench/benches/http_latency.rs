@@ -5,8 +5,7 @@
 //! library; this file is just the criterion harness on top of it. The `replay`
 //! binary (`src/bin/replay.rs`) drives the same library without criterion.
 //!
-//! The work of serving a request is split into two measured phases, each its own
-//! criterion group:
+//! The work of serving a request is split across these criterion groups:
 //!   * `instantiation` — `Store::new` + `Component` instantiation. The expensive
 //!     `setup_p2`/`setup_p3` pre-instantiation is done once during setup and is
 //!     deliberately *excluded* from this measurement.
@@ -14,6 +13,11 @@
 //!     and reading the whole response body. Each measured request runs against a
 //!     fresh instance created in untimed setup, so only the request→response
 //!     path is timed.
+//!   * `execution_reuse` — the same request→response measurement, but every
+//!     request in a batch is served by *one* instance created once in untimed
+//!     setup (the pattern the `replay` binary uses). Comparing it against
+//!     `execution` shows the per-request cost of a fresh instance vs. reusing a
+//!     warm one.
 //!
 //! The `.wasm` files are produced by the `justfile` (`just build p2` /
 //! `just build p3`) and are git-ignored, so build them before running:
@@ -140,6 +144,52 @@ fn benchmarks(c: &mut Criterion) {
         });
     });
     exec.finish();
+
+    // Execution (reused instance): identical request→response measurement, but a
+    // single instance is created once in untimed setup and reused for every
+    // request in the batch — so both instantiation *and* per-request instance
+    // teardown are excluded, and each request runs against an already-warm
+    // instance. This mirrors the `replay` binary.
+    let mut exec_reuse = c.benchmark_group("execution_reuse");
+    exec_reuse.bench_function("p2", |b| {
+        let p2 = &p2;
+        b.to_async(&rt).iter_custom(move |iters| async move {
+            // Untimed setup: one instance, reused across every iteration below.
+            let mut instance = p2.instantiate().await.expect("p2 instantiate");
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let start = Instant::now();
+                let out = instance.execute().await.expect("p2 execute");
+                total += start.elapsed();
+                // Untimed: drop only the response; the instance lives on to serve
+                // the next request, so instance teardown is excluded here.
+                drop(black_box(out));
+            }
+            // Untimed teardown: the store + instance drop after the timer stops.
+            drop(instance);
+            total
+        });
+    });
+    exec_reuse.bench_function("p3", |b| {
+        let p3 = &p3;
+        b.to_async(&rt).iter_custom(move |iters| async move {
+            // Untimed setup: one instance, reused across every iteration below.
+            let mut instance = p3.instantiate().await.expect("p3 instantiate");
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let start = Instant::now();
+                let out = instance.execute().await.expect("p3 execute");
+                total += start.elapsed();
+                // Untimed: drop only the response; the instance lives on to serve
+                // the next request, so instance teardown is excluded here.
+                drop(black_box(out));
+            }
+            // Untimed teardown: the store + instance drop after the timer stops.
+            drop(instance);
+            total
+        });
+    });
+    exec_reuse.finish();
 }
 
 criterion_group!(benches, benchmarks);

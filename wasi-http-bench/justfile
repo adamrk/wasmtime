@@ -1,6 +1,6 @@
 build preview:
   cargo +nightly build --lib --target wasm32-wasip2 --features {{preview}} --release
-  rm example_{{preview}}.wasm
+  rm -f example_{{preview}}.wasm
   cp ../target/wasm32-wasip2/release/wasi_http_bench.wasm example_{{preview}}.wasm
 
 serve preview: (build preview)
