@@ -1,6 +1,7 @@
 build preview:
-  cargo +nightly build --target wasm32-wasip2 --features {{preview}} --release
-  mv ../target/wasm32-wasip2/release/wasi_http_bench.wasm example_{{preview}}.wasm
+  cargo +nightly build --lib --target wasm32-wasip2 --features {{preview}} --release
+  rm example_{{preview}}.wasm
+  cp ../target/wasm32-wasip2/release/wasi_http_bench.wasm example_{{preview}}.wasm
 
 serve preview: (build preview)
   wasmtime serve -Sp3 -Scli -Wcomponent-model-async example_{{preview}}.wasm
@@ -8,3 +9,8 @@ serve preview: (build preview)
 # Build both components, then measure request->response latency with criterion.
 bench: (build "p2") (build "p3")
   cargo bench
+
+# Build the given component, then replay the execution phase `iters` times
+# against a single instance (setup + instantiation happen once).
+replay preview iters="1000": (build preview)
+  cargo run --release --bin replay -- {{preview}} {{iters}}
