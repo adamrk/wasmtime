@@ -36,5 +36,3 @@ harness = false
 # Only affects the host bench build; the wasm32 guest uses the `release` profile.
 [profile.bench]
 debug = true
-
-[workspace]

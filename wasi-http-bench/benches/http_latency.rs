@@ -40,7 +40,7 @@ use http_body_util::{BodyExt, Empty};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Error, Result, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-use wasmtime_wasi_http::WasiHttpCtx;
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpHooks};
 
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::bindings::{Proxy, ProxyPre};
@@ -79,19 +79,12 @@ impl WasiView for Host {
     }
 }
 
-impl wasmtime_wasi_http::p2::WasiHttpView for Host {
-    fn http(&mut self) -> wasmtime_wasi_http::p2::WasiHttpCtxView<'_> {
-        wasmtime_wasi_http::p2::WasiHttpCtxView {
-            ctx: &mut self.http,
-            table: &mut self.table,
-            hooks: Default::default(),
-        }
-    }
-}
+struct Hooks;
+impl WasiHttpHooks for Hooks {}
 
-impl wasmtime_wasi_http::p3::WasiHttpView for Host {
-    fn http(&mut self) -> wasmtime_wasi_http::p3::WasiHttpCtxView<'_> {
-        wasmtime_wasi_http::p3::WasiHttpCtxView {
+impl wasmtime_wasi_http::WasiHttpView for Host {
+    fn http(&mut self) -> wasmtime_wasi_http::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::WasiHttpCtxView {
             ctx: &mut self.http,
             table: &mut self.table,
             hooks: Default::default(),
@@ -166,10 +159,10 @@ async fn execute_p2(store: &mut Store<Host>, proxy: &Proxy) -> Result<(u16, Byte
 
     // Register the request and a response-outparam with the wasi-http context.
     let (sender, receiver) = tokio::sync::oneshot::channel();
-    let request = wasmtime_wasi_http::p2::WasiHttpView::http(store.data_mut())
+    let request = wasmtime_wasi_http::WasiHttpView::http(store.data_mut())
         .new_incoming_request(Scheme::Http, req)?;
     let out =
-        wasmtime_wasi_http::p2::WasiHttpView::http(store.data_mut()).new_response_outparam(sender)?;
+        wasmtime_wasi_http::WasiHttpView::http(store.data_mut()).new_response_outparam(sender)?;
 
     let incoming = proxy.wasi_http_incoming_handler();
     let call = incoming.call_handle(&mut *store, request, out);
@@ -216,11 +209,13 @@ async fn execute_p3(store: &mut Store<Host>, service: &Service) -> Result<(u16, 
                 .uri("http://localhost/")
                 .header("foo", "bar")
                 .body::<UnsyncBoxBody<Bytes, P3ErrorCode>>(empty_body())?;
-            let (p3_req, req_io) = P3Request::from_http(req);
+            let (p3_req, req_io) = P3Request::from_http(&mut Hooks, req);
 
             let resp = match service.handle(accessor, p3_req).await? {
                 Ok(resp) => resp,
-                Err(code) => return Err(Error::msg(format!("guest returned error-code: {code:?}"))),
+                Err(code) => {
+                    return Err(Error::msg(format!("guest returned error-code: {code:?}")));
+                }
             };
 
             // Turn the guest `Response` resource into an `http::Response` whose
@@ -250,24 +245,40 @@ fn benchmarks(c: &mut Criterion) {
     let p2_pre = {
         let component = load_component(&engine, "example_p2.wasm");
         let linker = build_linker(&engine).expect("failed to build linker");
-        ProxyPre::new(linker.instantiate_pre(&component).expect("p2 instantiate_pre"))
-            .expect("example_p2.wasm does not export wasi:http/incoming-handler@0.2")
+        ProxyPre::new(
+            linker
+                .instantiate_pre(&component)
+                .expect("p2 instantiate_pre"),
+        )
+        .expect("example_p2.wasm does not export wasi:http/incoming-handler@0.2")
     };
     let p3_pre = {
         let component = load_component(&engine, "example_p3.wasm");
         let linker = build_linker(&engine).expect("failed to build linker");
-        ServicePre::new(linker.instantiate_pre(&component).expect("p3 instantiate_pre"))
-            .expect("example_p3.wasm does not export wasi:http/handler@0.3")
+        ServicePre::new(
+            linker
+                .instantiate_pre(&component)
+                .expect("p3 instantiate_pre"),
+        )
+        .expect("example_p3.wasm does not export wasi:http/handler@0.3")
     };
 
     // Sanity-check the wiring up front so a misconfiguration fails loudly rather
     // than showing up as a mysteriously slow (panicking) benchmark.
     {
-        let (mut store, proxy) = rt.block_on(instantiate_p2(&p2_pre)).expect("p2 instantiate");
-        let (s2, b2) = rt.block_on(execute_p2(&mut store, &proxy)).expect("p2 warmup");
+        let (mut store, proxy) = rt
+            .block_on(instantiate_p2(&p2_pre))
+            .expect("p2 instantiate");
+        let (s2, b2) = rt
+            .block_on(execute_p2(&mut store, &proxy))
+            .expect("p2 warmup");
         assert_eq!(s2, 200, "expected 200 from p2, got {s2}");
-        let (mut store, service) = rt.block_on(instantiate_p3(&p3_pre)).expect("p3 instantiate");
-        let (s3, b3) = rt.block_on(execute_p3(&mut store, &service)).expect("p3 warmup");
+        let (mut store, service) = rt
+            .block_on(instantiate_p3(&p3_pre))
+            .expect("p3 instantiate");
+        let (s3, b3) = rt
+            .block_on(execute_p3(&mut store, &service))
+            .expect("p3 warmup");
         assert_eq!(s3, 200, "expected 200 from p3, got {s3}");
         eprintln!(
             "warmup ok: p2 -> {s2} ({} bytes), p3 -> {s3} ({} bytes)",

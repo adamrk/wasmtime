@@ -213,6 +213,7 @@ members = [
   "examples/wasip2-plugins",
   "fuzz",
   "winch/codegen",
+  "wasi-http-bench",
 ]
 exclude = [
   'docs/rust_wasi_markdown_parser',
