@@ -1,0 +1,10 @@
+build preview:
+  cargo +nightly build --target wasm32-wasip2 --features {{preview}} --release
+  mv target/wasm32-wasip2/release/wasi_http_bench.wasm example_{{preview}}.wasm
+
+serve preview: (build preview)
+  wasmtime serve -Sp3 -Scli -Wcomponent-model-async example_{{preview}}.wasm
+
+# Build both components, then measure request->response latency with criterion.
+bench: (build "p2") (build "p3")
+  cargo bench

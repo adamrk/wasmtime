@@ -1,0 +1,40 @@
+[package]
+name = "wasi-http-bench"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ['cdylib']
+
+[dependencies]
+wasip3 = { version = "0.7.1", features = ["async-spawn"], optional = true }
+wasip2 = { version = "1.0.0", optional = true }
+
+[features]
+p3 = ["dep:wasip3"]
+p2 = ["dep:wasip2"]
+
+# Host-side benchmark dependencies. These are compiled only for `cargo bench`
+# (host target); they are NOT part of the wasm32 `cdylib` guest build, which is
+# driven by the `p2`/`p3` features above.
+[dev-dependencies]
+wasmtime = { path = "../crates/wasmtime", features = ["component-model-async"] }
+wasmtime-wasi = { path = "../crates/wasi" }
+wasmtime-wasi-http = { path = "../crates/wasi-http", features = ["p3", "component-model-async"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "http_latency"
+harness = false
+
+# Emit debug info in the benchmark binary so flamegraphs (xctrace/Instruments on
+# macOS, perf on Linux) symbolicate to function + line rather than raw addresses.
+# Only affects the host bench build; the wasm32 guest uses the `release` profile.
+[profile.bench]
+debug = true
+
+[workspace]
