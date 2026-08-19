@@ -106,6 +106,7 @@ pub fn build_engine() -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
+    config.profiler(wasmtime::ProfilingStrategy::PerfMap);
     Engine::new(&config)
 }
 

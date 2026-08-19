@@ -44,9 +44,3 @@ harness = false
 [[bin]]
 name = "replay"
 bench = false
-
-# Emit debug info in the benchmark binary so flamegraphs (xctrace/Instruments on
-# macOS, perf on Linux) symbolicate to function + line rather than raw addresses.
-# Only affects the host bench build; the wasm32 guest uses the `release` profile.
-[profile.bench]
-debug = true

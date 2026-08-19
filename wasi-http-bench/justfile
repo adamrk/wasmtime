@@ -1,7 +1,7 @@
 build preview:
   cargo +nightly build --lib --target wasm32-wasip2 --features {{preview}} --release
   rm -f example_{{preview}}.wasm
-  cp ../target/wasm32-wasip2/release/wasi_http_bench.wasm example_{{preview}}.wasm
+  cp ../target/wasm32-wasip2/perf/wasi_http_bench.wasm example_{{preview}}.wasm
 
 serve preview: (build preview)
   wasmtime serve -Sp3 -Scli -Wcomponent-model-async example_{{preview}}.wasm
@@ -14,3 +14,8 @@ bench: (build "p2") (build "p3")
 # against a single instance (setup + instantiation happen once).
 replay preview iters="1000": (build preview)
   cargo run --release --bin replay -- {{preview}} {{iters}}
+
+perf preview: (build preview)
+  cargo build --release --bin replay
+  perf record --call-graph fp -k mono ../target/perf/replay {{preview}} 100000
+  perf inject --jit --input perf.data --output perf.jit.data
