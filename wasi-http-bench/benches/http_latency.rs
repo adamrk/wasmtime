@@ -38,10 +38,13 @@ fn benchmarks(c: &mut Criterion) {
         .expect("failed to build tokio runtime");
 
     // One-time setup (engine, linker, pre-instantiation), shared by both groups.
-    // This cost is intentionally *not* measured by either benchmark below.
-    let engine = build_engine().expect("failed to build engine");
-    let p2 = setup_p2(&engine).expect("p2 setup");
-    let p3 = setup_p3(&engine).expect("p3 setup");
+    // This cost is intentionally *not* measured by either benchmark below. The
+    // engine is shared by p2 and p3, so component-model async is enabled (p3
+    // needs it; harmless for p2).
+    let p2_engine = build_engine(false).expect("failed to build engine");
+    let p3_engine = build_engine(true).expect("failed to build engine");
+    let p2 = setup_p2(&p2_engine).expect("p2 setup");
+    let p3 = setup_p3(&p3_engine).expect("p3 setup");
 
     // Sanity-check the wiring up front so a misconfiguration fails loudly rather
     // than showing up as a mysteriously slow (panicking) benchmark.

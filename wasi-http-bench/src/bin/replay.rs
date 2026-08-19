@@ -48,7 +48,9 @@ mod imp {
             .build()?;
 
         // A single engine is shared by both previews, matching the benchmark.
-        let engine = build_engine()?;
+        // Component-model async is only enabled when the p3 guest will run; the
+        // p2 guest does not use it.
+        let engine = build_engine(do_p3)?;
 
         if do_p2 {
             rt.block_on(replay_p2(&engine, iters))?;

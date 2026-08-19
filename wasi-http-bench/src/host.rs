@@ -97,30 +97,41 @@ impl wasmtime_wasi_http::WasiHttpView for Host {
     }
 }
 
-/// Build an `Engine` configured for component-model async (required to drive the
-/// p3 component under `run_concurrent`; harmless for p2).
+/// Build an `Engine` for the benchmark.
 ///
-/// Share a single engine across [`setup_p2`] and [`setup_p3`] when benchmarking
-/// both previews together.
-pub fn build_engine() -> Result<Engine> {
+/// `component_model_async` enables the component-model async ABI. The Preview 3
+/// guest requires it (its body is produced by a spawned task and it is driven
+/// under `run_concurrent`); the Preview 2 guest does not use it, so a p2-only
+/// run can leave it disabled. When a single engine is shared across both
+/// previews, enable it — p3 needs it and it is harmless for p2.
+pub fn build_engine(component_model_async: bool) -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
-    config.wasm_component_model_async(true);
+    config.wasm_component_model_async(component_model_async);
     config.profiler(wasmtime::ProfilingStrategy::PerfMap);
     Engine::new(&config)
 }
 
-/// A linker satisfying the imports of *both* example components.
-///
-/// Both components import `wasi:{io,cli,clocks,random}@0.2.x` (added by
-/// `wasmtime_wasi::p2::add_to_linker_async`). `example_p2.wasm` additionally
-/// imports `wasi:http@0.2` and `example_p3.wasm` imports `wasi:http/types@0.3`;
-/// adding both http versions is harmless for whichever component only needs one.
-/// This mirrors `wasmtime serve -Scli -Sp3`.
-fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
+/// A linker satisfying the imports of `example_p2.wasm`: the common
+/// `wasi:{io,cli,clocks,random}@0.2` imports (added by
+/// `wasmtime_wasi::p2::add_to_linker_async`) plus `wasi:http@0.2`.
+fn build_p2_linker(engine: &Engine) -> Result<Linker<Host>> {
     let mut linker = Linker::<Host>::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
+    Ok(linker)
+}
+
+/// A linker satisfying the imports of `example_p3.wasm`: the common
+/// `wasi:{io,cli,clocks,random}@0.2` imports (added by
+/// `wasmtime_wasi::p2::add_to_linker_async`) plus `wasi:http/types@0.3`.
+///
+/// `wasmtime_wasi_http::p3::add_to_linker` registers the component-model async
+/// wasi-http host functions, so the engine must have been built with
+/// component-model async enabled (see [`build_engine`]).
+fn build_p3_linker(engine: &Engine) -> Result<Linker<Host>> {
+    let mut linker = Linker::<Host>::new(engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
     Ok(linker)
 }
@@ -161,7 +172,7 @@ pub struct P2Bench {
 /// instantiation nor the execution measurement should include.
 pub fn setup_p2(engine: &Engine) -> Result<P2Bench> {
     let component = load_component(engine, P2_COMPONENT)?;
-    let linker = build_linker(engine)?;
+    let linker = build_p2_linker(engine)?;
     let pre = ProxyPre::new(linker.instantiate_pre(&component)?).map_err(|e| {
         Error::msg(format!(
             "{P2_COMPONENT} does not export wasi:http/incoming-handler@0.2: {e}"
@@ -255,7 +266,7 @@ pub struct P3Bench {
 /// instantiation nor the execution measurement should include.
 pub fn setup_p3(engine: &Engine) -> Result<P3Bench> {
     let component = load_component(engine, P3_COMPONENT)?;
-    let linker = build_linker(engine)?;
+    let linker = build_p3_linker(engine)?;
     let pre = ServicePre::new(linker.instantiate_pre(&component)?).map_err(|e| {
         Error::msg(format!(
             "{P3_COMPONENT} does not export wasi:http/handler@0.3: {e}"
