@@ -174,7 +174,41 @@ fn iloop(config: &mut Config) -> Result<()> {
         "#,
     )?;
 
-    iloop_aborts(
+    fn iloop_aborts(config: &Config, wat: &str) -> Result<()> {
+        log::debug!("Testing infinite loop:\n{wat}");
+        let engine = Engine::new(&config)?;
+        let module = Module::new(&engine, wat)?;
+        let mut store = Store::new(&engine, ());
+        store.set_fuel(10_000)?;
+        let error = Instance::new(&mut store, &module, &[]).err().unwrap();
+        assert_eq!(error.downcast::<Trap>().unwrap(), Trap::OutOfFuel);
+        Ok(())
+    }
+
+    Ok(())
+}
+
+/// The size-proportional ("variable") fuel for a bulk operation is charged
+/// only *after* the operation succeeds. A single huge in-bounds op therefore no
+/// longer aborts partway through when its requested size alone exceeds the
+/// remaining fuel: it runs to completion, and the deferred charge simply drains
+/// the counter to zero. (Contrast `iloop`, whose control-flow constructs still
+/// trap `OutOfFuel` at a fuel check.)
+///
+/// The array copy/fill/init_data/init_elem ops are omitted here because they
+/// operate on a pre-existing array whose `array.new_default` construction would
+/// itself drain the fuel before the op under test runs; their size accounting
+/// is covered by `custom_variable_operator_cost` and the deferred-charge
+/// relocation by the array-creation ops above plus
+/// `variable_operator_cost_charged_only_on_success`.
+#[wasmtime_test(wasm_features(gc, function_references, bulk_memory))]
+#[cfg_attr(miri, ignore)]
+fn bulk_ops_defer_variable_fuel(config: &mut Config) -> Result<()> {
+    let _ = env_logger::try_init();
+
+    config.consume_fuel(true);
+
+    bulk_op_drains_fuel(
         &config,
         r#"
             (module
@@ -190,7 +224,7 @@ fn iloop(config: &mut Config) -> Result<()> {
         "#,
     )?;
 
-    iloop_aborts(
+    bulk_op_drains_fuel(
         &config,
         r#"
             (module
@@ -207,7 +241,7 @@ fn iloop(config: &mut Config) -> Result<()> {
     )?;
 
     let data = "a".repeat(65536);
-    iloop_aborts(
+    bulk_op_drains_fuel(
         &config,
         &format!(
             r#"
@@ -227,7 +261,7 @@ fn iloop(config: &mut Config) -> Result<()> {
         ),
     )?;
 
-    iloop_aborts(
+    bulk_op_drains_fuel(
         &config,
         r#"
             (module
@@ -243,7 +277,7 @@ fn iloop(config: &mut Config) -> Result<()> {
         "#,
     )?;
 
-    iloop_aborts(
+    bulk_op_drains_fuel(
         &config,
         r#"
             (module
@@ -259,7 +293,7 @@ fn iloop(config: &mut Config) -> Result<()> {
         "#,
     )?;
 
-    iloop_aborts(
+    bulk_op_drains_fuel(
         &config,
         r#"
             (module
@@ -276,7 +310,7 @@ fn iloop(config: &mut Config) -> Result<()> {
     )?;
 
     let elems = "$f ".repeat(20000);
-    iloop_aborts(
+    bulk_op_drains_fuel(
         &config,
         &format!(
             r#"
@@ -296,7 +330,7 @@ fn iloop(config: &mut Config) -> Result<()> {
         ),
     )?;
 
-    iloop_aborts(
+    bulk_op_drains_fuel(
         &config,
         r#"
             (module
@@ -311,45 +345,7 @@ fn iloop(config: &mut Config) -> Result<()> {
         "#,
     )?;
 
-    iloop_aborts(
-        &config,
-        r#"
-            (module
-                (type $a (array (mut i8)))
-                (start 0)
-                (global $a (ref $a) i32.const 20000 array.new_default $a)
-                (global $b (ref $a) i32.const 20000 array.new_default $a)
-                (func
-                    global.get $a
-                    i32.const 0
-                    global.get $b
-                    i32.const 0
-                    i32.const 20000
-                    array.copy $a $a
-                )
-            )
-        "#,
-    )?;
-
-    iloop_aborts(
-        &config,
-        r#"
-            (module
-                (type $a (array (mut i8)))
-                (start 0)
-                (global $a (ref $a) i32.const 20000 array.new_default $a)
-                (func
-                    global.get $a
-                    i32.const 0
-                    i32.const 0
-                    i32.const 20000
-                    array.fill $a
-                )
-            )
-        "#,
-    )?;
-
-    iloop_aborts(
+    bulk_op_drains_fuel(
         &config,
         &format!(
             r#"
@@ -369,29 +365,7 @@ fn iloop(config: &mut Config) -> Result<()> {
         ),
     )?;
 
-    iloop_aborts(
-        &config,
-        &format!(
-            r#"
-            (module
-                (type $a (array (mut i8)))
-                (start 0)
-                (global $a (ref $a) i32.const 20000 array.new_default $a)
-                (func
-                    global.get $a
-                    i32.const 0
-                    i32.const 0
-                    i32.const 20000
-                    array.init_data $a $d
-                )
-
-                (data $d "{data}")
-            )
-            "#
-        ),
-    )?;
-
-    iloop_aborts(
+    bulk_op_drains_fuel(
         &config,
         &format!(
             r#"
@@ -411,29 +385,7 @@ fn iloop(config: &mut Config) -> Result<()> {
         ),
     )?;
 
-    iloop_aborts(
-        &config,
-        &format!(
-            r#"
-            (module
-                (type $a (array (mut funcref)))
-                (start 0)
-                (global $a (ref $a) i32.const 20000 array.new_default $a)
-                (func
-                    global.get $a
-                    i32.const 0
-                    i32.const 0
-                    i32.const 20000
-                    array.init_elem $a $e
-                )
-                (func $f)
-                (elem $e func {elems})
-            )
-            "#
-        ),
-    )?;
-
-    iloop_aborts(
+    bulk_op_drains_fuel(
         &config,
         r#"
             (module
@@ -449,14 +401,20 @@ fn iloop(config: &mut Config) -> Result<()> {
         "#,
     )?;
 
-    fn iloop_aborts(config: &Config, wat: &str) -> Result<()> {
-        log::debug!("Testing infinite loop:\n{wat}");
+    fn bulk_op_drains_fuel(config: &Config, wat: &str) -> Result<()> {
+        log::debug!("Testing deferred bulk-op fuel:\n{wat}");
         let engine = Engine::new(&config)?;
         let module = Module::new(&engine, wat)?;
         let mut store = Store::new(&engine, ());
         store.set_fuel(10_000)?;
-        let error = Instance::new(&mut store, &module, &[]).err().unwrap();
-        assert_eq!(error.downcast::<Trap>().unwrap(), Trap::OutOfFuel);
+        // The op's requested size (>= 20k units at the default cost of 1) far
+        // exceeds the 10k fuel available, but the size-proportional charge now
+        // lands only after the op succeeds -- and nothing re-checks fuel
+        // afterwards in this single-shot start function -- so instantiation
+        // completes rather than trapping. The deferred charge still drains the
+        // counter to zero.
+        Instance::new(&mut store, &module, &[])?;
+        assert_eq!(store.get_fuel()?, 0);
         Ok(())
     }
 
@@ -911,31 +869,118 @@ fn variable_operator_cost_follows_bounds_check(config: &mut Config) -> Result<()
     Ok(())
 }
 
-#[wasmtime_test(wasm_features(memory64), strategies(not(Winch)))]
+#[wasmtime_test(wasm_features(bulk_memory), strategies(not(Winch)))]
 #[cfg_attr(miri, ignore)]
-fn memory64_variable_operator_cost_saturates(config: &mut Config) -> Result<()> {
+fn variable_operator_cost_charged_only_on_success(config: &mut Config) -> Result<()> {
     config.consume_fuel(true);
-    let mut operator_cost = OperatorCost::default();
-    operator_cost.variable.memory_grow_per_page = 2;
-    config.operator_cost(operator_cost);
+    let op_cost = OperatorCost {
+        I32Const: 0,
+        LocalGet: 0,
+        MemoryFill: 0,
+        variable: VariableOperatorCost {
+            memory_fill_per_byte: 3,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    config.operator_cost(op_cost);
 
     let engine = Engine::new(config)?;
     let module = Module::new(
         &engine,
         r#"(module
-            (memory i64 0 0)
+            (memory 1)
+            (func (export "fill") (param $dst i32) (param $len i32)
+                local.get $dst
+                i32.const 0
+                local.get $len
+                memory.fill)
+        )"#,
+    )?;
+    let mut store = Store::new(&engine, ());
+    let fill = {
+        let instance = Instance::new(&mut store, &module, &[])?;
+        instance.get_typed_func::<(i32, i32), ()>(&mut store, "fill")?
+    };
+
+    // The length is a runtime value, so the per-byte cost takes the deferred
+    // path (charged after the fill succeeds) rather than the small-constant
+    // fast path.
+
+    // In-bounds fill of 1000 bytes: billed 1000 * 3 on the success path, plus
+    // the single baseline unit.
+    store.set_fuel(1_000_000)?;
+    let initial_fuel = store.get_fuel()?;
+    fill.call(&mut store, (0, 1000))?;
+    assert_eq!(initial_fuel - store.get_fuel()?, 1000 * 3 + 1);
+
+    // Out-of-bounds fill of 1000 bytes (dst 65_000 + 1000 exceeds the
+    // 65_536-byte memory): the op traps during bounds validation, before the
+    // deferred per-byte charge runs. As with any trap the pending fuel is
+    // discarded, so the counter is left untouched.
+    store.set_fuel(1_000_000)?;
+    let initial_fuel = store.get_fuel()?;
+    let error = fill.call(&mut store, (65_000, 1000)).unwrap_err();
+    assert_eq!(error.downcast::<Trap>().unwrap(), Trap::MemoryOutOfBounds);
+    assert_eq!(store.get_fuel()?, initial_fuel);
+
+    Ok(())
+}
+
+#[wasmtime_test(wasm_features(memory64), strategies(not(Winch)))]
+#[cfg_attr(miri, ignore)]
+fn memory64_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
+    config.consume_fuel(true);
+    let op_cost = OperatorCost {
+        LocalGet: 0,
+        MemoryGrow: 0,
+        variable: VariableOperatorCost {
+            memory_grow_per_page: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    config.operator_cost(op_cost);
+
+    let engine = Engine::new(config)?;
+    let module = Module::new(
+        &engine,
+        r#"(module
+            (memory i64 0 100)
             (func (export "grow") (param i64) (result i64)
                 local.get 0 memory.grow)
         )"#,
     )?;
     let mut store = Store::new(&engine, ());
-    store.set_fuel(10_000)?;
-    let instance = Instance::new(&mut store, &module, &[])?;
-    let grow = instance.get_typed_func::<i64, i64>(&mut store, "grow")?;
+    let grow = {
+        let instance = Instance::new(&mut store, &module, &[])?;
+        instance.get_typed_func::<i64, i64>(&mut store, "grow")?
+    };
 
-    // i64::MAX * 2 must saturate at i64::MAX rather than wrap to -2.
-    let error = grow.call(&mut store, i64::MAX).unwrap_err();
-    assert_eq!(error.downcast::<Trap>().unwrap(), Trap::OutOfFuel);
+    // A dynamic (non-constant) delta keeps the op off the small-constant fast
+    // path, so the per-page cost is deferred to the success continuation.
+
+    // Successful grow (0 -> 50 pages, under the max of 100): billed 50 * 2 plus
+    // the single baseline unit.
+    store.set_fuel(1_000_000)?;
+    let initial_fuel = store.get_fuel()?;
+    assert_eq!(grow.call(&mut store, 50)?, 0);
+    assert_eq!(initial_fuel - store.get_fuel()?, 50 * 2 + 1);
+
+    // Failed grow (50 + 60 exceeds the max of 100): returns -1 without trapping
+    // and is billed only the baseline unit -- never the deferred per-page cost.
+    store.set_fuel(1_000_000)?;
+    let initial_fuel = store.get_fuel()?;
+    assert_eq!(grow.call(&mut store, 60)?, -1);
+    assert_eq!(initial_fuel - store.get_fuel()?, 1);
+
+    // A saturating i64::MAX delta likewise just fails (returns -1); the
+    // i64::MAX * 2 page cost is never charged because it is deferred to a
+    // success path that is not taken.
+    store.set_fuel(10_000)?;
+    let initial_fuel = store.get_fuel()?;
+    assert_eq!(grow.call(&mut store, i64::MAX)?, -1);
+    assert!(initial_fuel - store.get_fuel()? < 100);
 
     Ok(())
 }
@@ -943,29 +988,61 @@ fn memory64_variable_operator_cost_saturates(config: &mut Config) -> Result<()> 
 #[wasmtime_test(wasm_features(memory64, reference_types), strategies(not(Winch)))]
 #[cfg_attr(miri, ignore)]
 #[cfg(target_pointer_width = "64")]
-fn table64_variable_operator_cost_saturates(config: &mut Config) -> Result<()> {
+fn table64_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
     config.consume_fuel(true);
-    let mut operator_cost = OperatorCost::default();
-    operator_cost.variable.table_grow_per_element = 2;
-    config.operator_cost(operator_cost);
+    let op_cost = OperatorCost {
+        RefNull: 0,
+        LocalGet: 0,
+        TableGrow: 0,
+        variable: VariableOperatorCost {
+            table_grow_per_element: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    config.operator_cost(op_cost);
 
     let engine = Engine::new(config)?;
     let module = Module::new(
         &engine,
         r#"(module
-            (table i64 0 0 funcref)
+            (table i64 0 100 funcref)
             (func (export "grow") (param i64) (result i64)
                 ref.null func local.get 0 table.grow)
         )"#,
     )?;
     let mut store = Store::new(&engine, ());
-    store.set_fuel(10_000)?;
-    let instance = Instance::new(&mut store, &module, &[])?;
-    let grow = instance.get_typed_func::<i64, i64>(&mut store, "grow")?;
+    let grow = {
+        let instance = Instance::new(&mut store, &module, &[])?;
+        instance.get_typed_func::<i64, i64>(&mut store, "grow")?
+    };
 
-    // i64::MAX * 2 must saturate at i64::MAX rather than wrap to -2.
-    let error = grow.call(&mut store, i64::MAX).unwrap_err();
-    assert_eq!(error.downcast::<Trap>().unwrap(), Trap::OutOfFuel);
+    // A dynamic (non-constant) delta keeps the op off the small-constant fast
+    // path, so the per-element cost is deferred to the success continuation.
+
+    // Successful grow (0 -> 50 elements, under the max of 100): billed 50 * 2
+    // plus the single baseline unit.
+    store.set_fuel(1_000_000)?;
+    let initial_fuel = store.get_fuel()?;
+    assert_eq!(grow.call(&mut store, 50)?, 0);
+    assert_eq!(initial_fuel - store.get_fuel()?, 50 * 2 + 1);
+
+    // Failed grow (50 + 60 exceeds the max of 100): returns -1 without trapping
+    // and is billed only the baseline unit -- never the deferred per-element
+    // cost.
+    store.set_fuel(1_000_000)?;
+    let initial_fuel = store.get_fuel()?;
+    assert_eq!(grow.call(&mut store, 60)?, -1);
+    assert_eq!(initial_fuel - store.get_fuel()?, 1);
+
+    // A saturating i64::MAX delta likewise just fails (returns -1); the
+    // i64::MAX * 2 element cost is never charged because it is deferred to a
+    // success path that is not taken.
+    store.set_fuel(10_000)?;
+    let initial_fuel = store.get_fuel()?;
+    assert_eq!(grow.call(&mut store, i64::MAX)?, -1);
+    assert!(initial_fuel - store.get_fuel()? < 100);
+
     Ok(())
 }
 
