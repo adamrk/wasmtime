@@ -189,11 +189,12 @@ fn iloop(config: &mut Config) -> Result<()> {
 }
 
 /// The size-proportional ("variable") fuel for a bulk operation is charged
-/// only *after* the operation succeeds. A single huge in-bounds op therefore no
-/// longer aborts partway through when its requested size alone exceeds the
-/// remaining fuel: it runs to completion, and the deferred charge simply drains
-/// the counter to zero. (Contrast `iloop`, whose control-flow constructs still
-/// trap `OutOfFuel` at a fuel check.)
+/// only *after* the operation succeeds, and the deferred fuel check follows
+/// that charge. A single huge in-bounds op therefore runs to completion and is
+/// billed for its work, but then -- because its requested size alone exceeds
+/// the remaining fuel -- trips the post-charge fuel check and traps
+/// `OutOfFuel`. (A trapping or failing op is, by contrast, never billed the
+/// deferred cost; see `variable_operator_cost_charged_only_on_success`.)
 ///
 /// The array copy/fill/init_data/init_elem ops are omitted here because they
 /// operate on a pre-existing array whose `array.new_default` construction would
@@ -208,7 +209,7 @@ fn bulk_ops_defer_variable_fuel(config: &mut Config) -> Result<()> {
 
     config.consume_fuel(true);
 
-    bulk_op_drains_fuel(
+    bulk_op_traps_after_charge(
         &config,
         r#"
             (module
@@ -224,7 +225,7 @@ fn bulk_ops_defer_variable_fuel(config: &mut Config) -> Result<()> {
         "#,
     )?;
 
-    bulk_op_drains_fuel(
+    bulk_op_traps_after_charge(
         &config,
         r#"
             (module
@@ -241,7 +242,7 @@ fn bulk_ops_defer_variable_fuel(config: &mut Config) -> Result<()> {
     )?;
 
     let data = "a".repeat(65536);
-    bulk_op_drains_fuel(
+    bulk_op_traps_after_charge(
         &config,
         &format!(
             r#"
@@ -261,7 +262,7 @@ fn bulk_ops_defer_variable_fuel(config: &mut Config) -> Result<()> {
         ),
     )?;
 
-    bulk_op_drains_fuel(
+    bulk_op_traps_after_charge(
         &config,
         r#"
             (module
@@ -277,7 +278,7 @@ fn bulk_ops_defer_variable_fuel(config: &mut Config) -> Result<()> {
         "#,
     )?;
 
-    bulk_op_drains_fuel(
+    bulk_op_traps_after_charge(
         &config,
         r#"
             (module
@@ -293,7 +294,7 @@ fn bulk_ops_defer_variable_fuel(config: &mut Config) -> Result<()> {
         "#,
     )?;
 
-    bulk_op_drains_fuel(
+    bulk_op_traps_after_charge(
         &config,
         r#"
             (module
@@ -310,7 +311,7 @@ fn bulk_ops_defer_variable_fuel(config: &mut Config) -> Result<()> {
     )?;
 
     let elems = "$f ".repeat(20000);
-    bulk_op_drains_fuel(
+    bulk_op_traps_after_charge(
         &config,
         &format!(
             r#"
@@ -330,7 +331,7 @@ fn bulk_ops_defer_variable_fuel(config: &mut Config) -> Result<()> {
         ),
     )?;
 
-    bulk_op_drains_fuel(
+    bulk_op_traps_after_charge(
         &config,
         r#"
             (module
@@ -345,7 +346,7 @@ fn bulk_ops_defer_variable_fuel(config: &mut Config) -> Result<()> {
         "#,
     )?;
 
-    bulk_op_drains_fuel(
+    bulk_op_traps_after_charge(
         &config,
         &format!(
             r#"
@@ -365,7 +366,7 @@ fn bulk_ops_defer_variable_fuel(config: &mut Config) -> Result<()> {
         ),
     )?;
 
-    bulk_op_drains_fuel(
+    bulk_op_traps_after_charge(
         &config,
         &format!(
             r#"
@@ -385,7 +386,7 @@ fn bulk_ops_defer_variable_fuel(config: &mut Config) -> Result<()> {
         ),
     )?;
 
-    bulk_op_drains_fuel(
+    bulk_op_traps_after_charge(
         &config,
         r#"
             (module
@@ -401,20 +402,20 @@ fn bulk_ops_defer_variable_fuel(config: &mut Config) -> Result<()> {
         "#,
     )?;
 
-    fn bulk_op_drains_fuel(config: &Config, wat: &str) -> Result<()> {
+    fn bulk_op_traps_after_charge(config: &Config, wat: &str) -> Result<()> {
         log::debug!("Testing deferred bulk-op fuel:\n{wat}");
         let engine = Engine::new(&config)?;
         let module = Module::new(&engine, wat)?;
         let mut store = Store::new(&engine, ());
         store.set_fuel(10_000)?;
         // The op's requested size (>= 20k units at the default cost of 1) far
-        // exceeds the 10k fuel available, but the size-proportional charge now
-        // lands only after the op succeeds -- and nothing re-checks fuel
-        // afterwards in this single-shot start function -- so instantiation
-        // completes rather than trapping. The deferred charge still drains the
-        // counter to zero.
-        Instance::new(&mut store, &module, &[])?;
-        assert_eq!(store.get_fuel()?, 0);
+        // exceeds the 10k fuel available. The size-proportional charge lands
+        // only after the op succeeds, so the op runs to completion and is
+        // billed for its work -- but the fuel check that now follows the charge
+        // then observes the exhausted budget and traps, aborting instantiation
+        // with `OutOfFuel`.
+        let error = Instance::new(&mut store, &module, &[]).err().unwrap();
+        assert_eq!(error.downcast::<Trap>().unwrap(), Trap::OutOfFuel);
         Ok(())
     }
 
@@ -1042,6 +1043,74 @@ fn table64_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
     let initial_fuel = store.get_fuel()?;
     assert_eq!(grow.call(&mut store, i64::MAX)?, -1);
     assert!(initial_fuel - store.get_fuel()? < 100);
+
+    Ok(())
+}
+
+/// A grow that fails -- returning `-1` because it exceeds its maximum rather
+/// than trapping -- must not be billed the deferred, size-proportional fuel,
+/// which is charged only on a grow's success continuation.
+///
+/// (Contrast `variable_operator_cost_failed_growth`, where a *small constant*
+/// grow is charged up front on the fast path and so is billed even when it
+/// fails. The 32-bit `memory.grow`/`table.grow` here complement the 64-bit
+/// `memory64_grow_charged_only_on_success` / `table64_grow_charged_only_on_success`.)
+#[wasmtime_test(wasm_features(reference_types), strategies(not(Winch)))]
+#[cfg_attr(miri, ignore)]
+fn failed_grow_does_not_consume_deferred_fuel(config: &mut Config) -> Result<()> {
+    config.consume_fuel(true);
+    // Zero every flat per-operator cost so the only fuel that could move is the
+    // size-proportional grow cost, and make that per-unit cost large.
+    let mut op_cost = OperatorCost {
+        LocalGet: 0,
+        RefNull: 0,
+        MemoryGrow: 0,
+        TableGrow: 0,
+        ..Default::default()
+    };
+    op_cost.variable.memory_grow_per_page = 200;
+    op_cost.variable.table_grow_per_element = 200;
+    config.operator_cost(op_cost);
+
+    let engine = Engine::new(config)?;
+    let module = Module::new(
+        &engine,
+        r#"(module
+            (memory 1 1)
+            (table 0 0 funcref)
+            (func (export "grow_memory") (param i32) (result i32)
+                local.get 0 memory.grow)
+            (func (export "grow_table") (param i32) (result i32)
+                ref.null func local.get 0 table.grow)
+        )"#,
+    )?;
+    let mut store = Store::new(&engine, ());
+    let (grow_memory, grow_table) = {
+        let instance = Instance::new(&mut store, &module, &[])?;
+        (
+            instance.get_typed_func::<i32, i32>(&mut store, "grow_memory")?,
+            instance.get_typed_func::<i32, i32>(&mut store, "grow_table")?,
+        )
+    };
+
+    // A dynamic (non-constant) delta keeps each grow on the deferred path, so
+    // its per-unit cost is charged only after a successful grow. Both grows
+    // below exceed their maximum and fail, returning -1.
+    //
+    // The store is given far less fuel (100) than a single grow's would-be
+    // variable charge (delta 100 * 200 = 20_000). If the failure path wrongly
+    // charged that cost the call would instead trap `OutOfFuel` and the `?`
+    // below would surface it; instead each grow returns -1 and spends only the
+    // single function-entry baseline unit (every operator cost is zeroed).
+    store.set_fuel(100)?;
+    let initial_fuel = store.get_fuel()?;
+    assert_eq!(grow_memory.call(&mut store, 100)?, -1);
+    assert_eq!(initial_fuel - store.get_fuel()?, 1);
+
+    store.set_fuel(100)?;
+    let initial_fuel = store.get_fuel()?;
+    assert_eq!(grow_table.call(&mut store, 100)?, -1);
+    assert_eq!(initial_fuel - store.get_fuel()?, 1);
 
     Ok(())
 }
