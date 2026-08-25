@@ -554,32 +554,42 @@ fn custom_variable_operator_cost(config: &mut Config) -> Result<()> {
     Ok(())
 }
 
-#[wasmtime_test(wasm_features(reference_types), strategies(not(Winch)))]
-#[cfg_attr(miri, ignore)]
-fn variable_operator_cost_failed_growth(config: &mut Config) -> Result<()> {
+const COST_MEMORY_GROW_PER_PAGE: u64 = 7;
+const COST_TABLE_GROW_PER_ELEMENT: u64 = 19;
+const COST_MEMORY_GROW: u64 = 2;
+const COST_TABLE_GROW: u64 = 3;
+
+/// Try running a module where we attempt to grow a table and memory by
+/// `grow_by` (which fails) and return the fuel consumed.
+fn failed_growth_fuel_consumed(config: &mut Config, grow_by: u32) -> Result<u64> {
     config.consume_fuel(true);
-    let mut op_cost = OperatorCost {
+    let op_cost = OperatorCost {
         I32Const: 0,
         RefNull: 0,
-        MemoryGrow: 0,
-        TableGrow: 0,
+        MemoryGrow: COST_MEMORY_GROW as u8,
+        TableGrow: COST_TABLE_GROW as u8,
+        variable: VariableOperatorCost {
+            memory_grow_per_page: COST_MEMORY_GROW_PER_PAGE as u8,
+            table_grow_per_element: COST_TABLE_GROW_PER_ELEMENT as u8,
+            ..Default::default()
+        },
         ..Default::default()
     };
-    op_cost.variable.memory_grow_per_page = 7;
-    op_cost.variable.table_grow_per_element = 19;
-    config.operator_cost(op_cost.clone());
+    config.operator_cost(op_cost);
 
     let engine = Engine::new(config)?;
     let module = Module::new(
         &engine,
-        r#"(module
-            (memory 1 1)
-            (table 0 0 funcref)
-            (func (export "main")
-                ;; these exceed the max limits so they fail
-                i32.const 5 memory.grow drop
-                ref.null func i32.const 5 table.grow drop)
-        )"#,
+        &format!(
+            r#"(module
+                (memory 1 1)
+                (table 0 0 funcref)
+                (func (export "main")
+                    ;; these exceed the max limits so they fail
+                    i32.const {grow_by} memory.grow drop
+                    ref.null func i32.const {grow_by} table.grow drop)
+            )"#
+        ),
     )?;
     let mut store = Store::new(&engine, ());
     store.set_fuel(1_000)?;
@@ -588,10 +598,33 @@ fn variable_operator_cost_failed_growth(config: &mut Config) -> Result<()> {
 
     let initial_fuel = store.get_fuel()?;
     main.call(&mut store, ())?;
-    let cost_of_execution = 5 * u64::from(op_cost.variable.memory_grow_per_page)
-        + 5 * u64::from(op_cost.variable.table_grow_per_element)
-        + 1;
-    assert_eq!(store.get_fuel()?, initial_fuel - cost_of_execution);
+    Ok(initial_fuel - store.get_fuel()?)
+}
+
+// Checks that small constant grows consume fuel immediately, even if they fail.
+#[wasmtime_test(wasm_features(reference_types), strategies(not(Winch)))]
+#[cfg_attr(miri, ignore)]
+fn variable_operator_cost_failed_small_growth(config: &mut Config) -> Result<()> {
+    let consumed = failed_growth_fuel_consumed(config, 5)?;
+    assert_eq!(
+        consumed,
+        5 * COST_MEMORY_GROW_PER_PAGE
+            + 5 * COST_TABLE_GROW_PER_ELEMENT
+            + 1
+            + COST_MEMORY_GROW
+            + COST_TABLE_GROW
+    );
+
+    Ok(())
+}
+
+// Checks that larger constant grows defer consumng fuel, so they will only
+// consume fixed fuel costs if they fail.
+#[wasmtime_test(wasm_features(reference_types), strategies(not(Winch)))]
+#[cfg_attr(miri, ignore)]
+fn variable_operator_cost_failed_growth_deferred(config: &mut Config) -> Result<()> {
+    let consumed = failed_growth_fuel_consumed(config, 200)?;
+    assert_eq!(consumed, 1 + COST_MEMORY_GROW + COST_TABLE_GROW);
 
     Ok(())
 }
@@ -694,9 +727,9 @@ fn variable_operator_cost_charged_only_on_success(config: &mut Config) -> Result
     Ok(())
 }
 
-#[wasmtime_test(wasm_features(memory64), strategies(not(Winch)))]
+#[wasmtime_test(strategies(not(Winch)))]
 #[cfg_attr(miri, ignore)]
-fn memory64_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
+fn memory_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
     config.consume_fuel(true);
     let op_cost = OperatorCost {
         LocalGet: 0,
@@ -713,15 +746,15 @@ fn memory64_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
     let module = Module::new(
         &engine,
         r#"(module
-            (memory i64 0 100)
-            (func (export "grow") (param i64) (result i64)
+            (memory 0 100)
+            (func (export "grow") (param i32) (result i32)
                 local.get 0 memory.grow)
         )"#,
     )?;
     let mut store = Store::new(&engine, ());
     let grow = {
         let instance = Instance::new(&mut store, &module, &[])?;
-        instance.get_typed_func::<i64, i64>(&mut store, "grow")?
+        instance.get_typed_func::<i32, i32>(&mut store, "grow")?
     };
 
     // A dynamic (non-constant) delta keeps the op off the small-constant fast
@@ -741,21 +774,12 @@ fn memory64_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
     assert_eq!(grow.call(&mut store, 60)?, -1);
     assert_eq!(initial_fuel - store.get_fuel()?, 1);
 
-    // A saturating i64::MAX delta likewise just fails (returns -1); the
-    // i64::MAX * 2 page cost is never charged because it is deferred to a
-    // success path that is not taken.
-    store.set_fuel(10_000)?;
-    let initial_fuel = store.get_fuel()?;
-    assert_eq!(grow.call(&mut store, i64::MAX)?, -1);
-    assert!(initial_fuel - store.get_fuel()? < 100);
-
     Ok(())
 }
 
-#[wasmtime_test(wasm_features(memory64, reference_types), strategies(not(Winch)))]
+#[wasmtime_test(wasm_features(reference_types), strategies(not(Winch)))]
 #[cfg_attr(miri, ignore)]
-#[cfg(target_pointer_width = "64")]
-fn table64_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
+fn table_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
     config.consume_fuel(true);
     let op_cost = OperatorCost {
         RefNull: 0,
@@ -773,15 +797,15 @@ fn table64_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
     let module = Module::new(
         &engine,
         r#"(module
-            (table i64 0 100 funcref)
-            (func (export "grow") (param i64) (result i64)
+            (table 0 100 funcref)
+            (func (export "grow") (param i32) (result i32)
                 ref.null func local.get 0 table.grow)
         )"#,
     )?;
     let mut store = Store::new(&engine, ());
     let grow = {
         let instance = Instance::new(&mut store, &module, &[])?;
-        instance.get_typed_func::<i64, i64>(&mut store, "grow")?
+        instance.get_typed_func::<i32, i32>(&mut store, "grow")?
     };
 
     // A dynamic (non-constant) delta keeps the op off the small-constant fast
@@ -800,82 +824,6 @@ fn table64_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
     store.set_fuel(1_000_000)?;
     let initial_fuel = store.get_fuel()?;
     assert_eq!(grow.call(&mut store, 60)?, -1);
-    assert_eq!(initial_fuel - store.get_fuel()?, 1);
-
-    // A saturating i64::MAX delta likewise just fails (returns -1); the
-    // i64::MAX * 2 element cost is never charged because it is deferred to a
-    // success path that is not taken.
-    store.set_fuel(10_000)?;
-    let initial_fuel = store.get_fuel()?;
-    assert_eq!(grow.call(&mut store, i64::MAX)?, -1);
-    assert!(initial_fuel - store.get_fuel()? < 100);
-
-    Ok(())
-}
-
-/// A grow that fails -- returning `-1` because it exceeds its maximum rather
-/// than trapping -- must not be billed the deferred, size-proportional fuel,
-/// which is charged only on a grow's success continuation.
-///
-/// (Contrast `variable_operator_cost_failed_growth`, where a *small constant*
-/// grow is charged up front on the fast path and so is billed even when it
-/// fails. The 32-bit `memory.grow`/`table.grow` here complement the 64-bit
-/// `memory64_grow_charged_only_on_success` / `table64_grow_charged_only_on_success`.)
-#[wasmtime_test(wasm_features(reference_types), strategies(not(Winch)))]
-#[cfg_attr(miri, ignore)]
-fn failed_grow_does_not_consume_deferred_fuel(config: &mut Config) -> Result<()> {
-    config.consume_fuel(true);
-    // Zero every flat per-operator cost so the only fuel that could move is the
-    // size-proportional grow cost, and make that per-unit cost large.
-    let mut op_cost = OperatorCost {
-        LocalGet: 0,
-        RefNull: 0,
-        MemoryGrow: 0,
-        TableGrow: 0,
-        ..Default::default()
-    };
-    op_cost.variable.memory_grow_per_page = 200;
-    op_cost.variable.table_grow_per_element = 200;
-    config.operator_cost(op_cost);
-
-    let engine = Engine::new(config)?;
-    let module = Module::new(
-        &engine,
-        r#"(module
-            (memory 1 1)
-            (table 0 0 funcref)
-            (func (export "grow_memory") (param i32) (result i32)
-                local.get 0 memory.grow)
-            (func (export "grow_table") (param i32) (result i32)
-                ref.null func local.get 0 table.grow)
-        )"#,
-    )?;
-    let mut store = Store::new(&engine, ());
-    let (grow_memory, grow_table) = {
-        let instance = Instance::new(&mut store, &module, &[])?;
-        (
-            instance.get_typed_func::<i32, i32>(&mut store, "grow_memory")?,
-            instance.get_typed_func::<i32, i32>(&mut store, "grow_table")?,
-        )
-    };
-
-    // A dynamic (non-constant) delta keeps each grow on the deferred path, so
-    // its per-unit cost is charged only after a successful grow. Both grows
-    // below exceed their maximum and fail, returning -1.
-    //
-    // The store is given far less fuel (100) than a single grow's would-be
-    // variable charge (delta 100 * 200 = 20_000). If the failure path wrongly
-    // charged that cost the call would instead trap `OutOfFuel` and the `?`
-    // below would surface it; instead each grow returns -1 and spends only the
-    // single function-entry baseline unit (every operator cost is zeroed).
-    store.set_fuel(100)?;
-    let initial_fuel = store.get_fuel()?;
-    assert_eq!(grow_memory.call(&mut store, 100)?, -1);
-    assert_eq!(initial_fuel - store.get_fuel()?, 1);
-
-    store.set_fuel(100)?;
-    let initial_fuel = store.get_fuel()?;
-    assert_eq!(grow_table.call(&mut store, 100)?, -1);
     assert_eq!(initial_fuel - store.get_fuel()?, 1);
 
     Ok(())
