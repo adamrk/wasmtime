@@ -2713,8 +2713,7 @@ impl FuncEnvironment<'_> {
             .brif(failed, failed_block, &[], fill_block, &[]);
 
         // A failed attempt performs no initialization loop and is not charged
-        // the size-proportional growth fuel; only the flat per-operator cost,
-        // already committed above, applies to a failed grow.
+        // the size-proportional growth fuel - only the flat per-operator cost.
         builder.switch_to_block(failed_block);
         builder.ins().jump(done_block, &[]);
 
@@ -2729,8 +2728,6 @@ impl FuncEnvironment<'_> {
             init_value,
             delta,
         )?;
-        // Growth succeeded: charge the deferred size-proportional fuel on this
-        // success path only.
         self.post_translate_bulk_op(builder, fuel)?;
         builder.ins().jump(done_block, &[]);
 
@@ -3639,14 +3636,16 @@ impl FuncEnvironment<'_> {
             0 => true,
             _ => unreachable!("only page sizes 2**0 and 2**16 are currently valid"),
         };
-        let result_idx =
-            self.convert_pointer_to_index_type(builder.cursor(), result, index_type, single_byte_pages);
+        let grow_result = self.convert_pointer_to_index_type(
+            builder.cursor(),
+            result,
+            index_type,
+            single_byte_pages,
+        );
 
         // Charge the deferred size-proportional fuel only when the grow
-        // actually succeeded; a failed grow returns the `-1` sentinel. This is
-        // skipped entirely in the common case because `memory_grow_per_page`
-        // defaults to 0, leaving nothing deferred and the fast path untouched.
-        if matches!(fuel, DeferredBulkFuel::Charge { .. }) {
+        // actually succeeded.
+        if fuel.is_some() {
             let current_block = builder.current_block().unwrap();
             let charge_block = builder.create_block();
             let done_block = builder.create_block();
@@ -3654,7 +3653,7 @@ impl FuncEnvironment<'_> {
             builder.insert_block_after(done_block, charge_block);
 
             let failure = builder.ins().iconst(index_type_to_ir_type(index_type), -1);
-            let failed = builder.ins().icmp(IntCC::Equal, result_idx, failure);
+            let failed = builder.ins().icmp(IntCC::Equal, grow_result, failure);
             builder
                 .ins()
                 .brif(failed, done_block, &[], charge_block, &[]);
@@ -3668,7 +3667,7 @@ impl FuncEnvironment<'_> {
             builder.seal_block(done_block);
         }
 
-        Ok(result_idx)
+        Ok(grow_result)
     }
 
     /// Loads the size, in bytes, of the memory `index` specified.
@@ -5109,74 +5108,63 @@ impl FuncEnvironment<'_> {
 
     /// Translation prefix before bulk operations such as `memory.copy`.
     ///
-    /// Takes a dynamic value `units` for the size of the operation as well as
-    /// a `cost_per_unit` configured for this operation. Emitted *before* a bulk
-    /// operation (copy/fill/init/grow).
+    /// Takes a dynamic value `units` for the size of the operation as well as a
+    /// `cost_per_unit` configured for this operation.
     ///
-    /// This charges the flat, statically-known portion of a small bulk op's
-    /// fuel up front. The size-proportional ("variable") fuel for anything but
-    /// a small constant-size op is *not* charged here; instead it is described
-    /// by the returned [`DeferredBulkFuel`], which the caller must hand to
-    /// [`Self::post_translate_bulk_op`] on the operation's success path. That
-    /// deferral keeps a trapping or failed op from being billed for work it
-    /// never performed. A fuel/epoch check is still emitted here to gate the op
-    /// on the budget available *before* it runs (and to let epoch-based
-    /// preemption happen ahead of a potentially large op); a second check in
-    /// `post_translate_bulk_op` then accounts for the op's own
-    /// size-proportional cost once it has completed.
+    /// If fuel is enabled, it'll calculate and return how much fuel should be
+    /// consumed if the operation succeeds. The return value should be used by
+    /// `post_translate_bulk_op` to consume the fuel _after_ the operation has
+    /// succeeded to prevent turning OOB traps into out-of-fuel traps.
+    ///
+    /// If fuel or epochs are enabled then a fuel/epoch check will occur.
+    ///
+    /// For constant small operations the fuel is consumed here, the deferred
+    /// charge is `None` and the fuel/epoch check is skipped.
+    ///
+    /// If neither fuel nor epochs are enabled this is a noop.
     fn pre_translate_bulk_op(
         &mut self,
         builder: &mut FunctionBuilder,
         units: ir::Value,
         cost_per_unit: u8,
-    ) -> WasmResult<DeferredBulkFuel> {
+    ) -> WasmResult<Option<DeferredBulkFuel>> {
         let const_units =
             Self::value_as_const_int(builder, units).map(|c| i64::try_from(c).unwrap_or(i64::MAX));
+        let should_consume_fuel = self.tunables.consume_fuel && cost_per_unit > 0;
 
         // Skip explicit fuel/epoch checks for operations which are
-        // subjectively, and statically, considered cheap. For these small
-        // constant-size ops we keep charging the (tiny, statically-known)
-        // variable cost up front and accept that a trapping op may be billed
-        // for work it didn't do; the amount is bounded by `SMALL_BULK_OP_COST`.
+        // subjectively, and statically, considered cheap and consume the fuel
+        // now instead of waiting to see if the operation succeeds.
         const SMALL_BULK_OP_COST: i64 = 128;
         if let Some(units) = const_units
             && let Some(cost) = units.checked_mul(i64::from(cost_per_unit))
             && cost <= SMALL_BULK_OP_COST
         {
-            if self.tunables.consume_fuel && cost_per_unit > 0 {
+            if should_consume_fuel {
                 self.fuel_consumed = self.fuel_consumed.saturating_add(cost);
             }
-            return Ok(DeferredBulkFuel::None);
+            return Ok(None);
         }
 
-        // For all other bulk ops (dynamic size, or a large constant size) the
-        // variable cost is deferred and charged after the op succeeds (see
-        // `post_translate_bulk_op`). We still emit a pre-op fuel/epoch check
-        // here so that epoch-based preemption happens before a potentially
-        // large operation and an already-exhausted fuel budget is detected up
-        // front -- gating the op's side effects on the fuel available *before*
-        // it runs. `post_translate_bulk_op` performs a second check afterwards
-        // to account for the size-proportional cost the op itself incurred.
-        //
         // This isn't a loop header but for fuel/epoch purposes it's the same
         // thing.
         self.translate_loop_header(builder)?;
 
-        if self.tunables.consume_fuel && cost_per_unit > 0 {
-            let units = match const_units {
-                Some(units) => DeferredBulkUnits::Const(units),
-                None => DeferredBulkUnits::Runtime(units),
-            };
-            Ok(DeferredBulkFuel::Charge {
-                units,
+        let deferred_charge = if should_consume_fuel {
+            Some(DeferredBulkFuel {
+                units: match const_units {
+                    Some(const_units) => DeferredBulkUnits::Const(const_units),
+                    None => DeferredBulkUnits::Runtime(units),
+                },
                 cost_per_unit,
             })
         } else {
-            Ok(DeferredBulkFuel::None)
-        }
+            None
+        };
+        Ok(deferred_charge)
     }
 
-    /// Emitted *after* a bulk operation has completed successfully, charging the
+    /// Emitted after a bulk operation has completed successfully, charging the
     /// size-proportional fuel deferred by [`Self::pre_translate_bulk_op`] and
     /// then performing a follow-up fuel/epoch check that accounts for the cost
     /// the op just incurred.
@@ -5190,12 +5178,12 @@ impl FuncEnvironment<'_> {
     fn post_translate_bulk_op(
         &mut self,
         builder: &mut FunctionBuilder,
-        fuel: DeferredBulkFuel,
+        fuel: Option<DeferredBulkFuel>,
     ) -> WasmResult<()> {
-        let DeferredBulkFuel::Charge {
+        let Some(DeferredBulkFuel {
             units,
             cost_per_unit,
-        } = fuel
+        }) = fuel
         else {
             return Ok(());
         };
@@ -6415,33 +6403,21 @@ fn index_type_to_ir_type(index_type: IndexType) -> ir::Type {
     }
 }
 
-/// Size-proportional ("variable") bulk-op fuel to charge *after* the operation
-/// has completed successfully.
+/// Size-proportional bulk-op fuel to charge after the operation has completed
+/// successfully.
 ///
 /// Produced by [`FuncEnvironment::pre_translate_bulk_op`] and consumed by
 /// [`FuncEnvironment::post_translate_bulk_op`]. Deferring the charge to the
-/// operation's success path means a bulk op that traps (copy/fill/init) or fails
-/// (grow) is not billed for the size-proportional work it never performed.
-#[must_use = "deferred bulk-op fuel must be passed to post_translate_bulk_op"]
-enum DeferredBulkFuel {
-    /// Nothing to charge afterwards: fuel is disabled, the per-unit cost is
-    /// zero, or a small constant-size op was already charged up front.
-    None,
-    /// Charge `units * cost_per_unit` fuel on the success path.
-    Charge {
-        /// The number of units (bytes/elements/pages) operated on.
-        units: DeferredBulkUnits,
-        /// The per-unit fuel cost; the charge is `units * cost_per_unit`,
-        /// saturating at `i64::MAX`.
-        cost_per_unit: u8,
-    },
+/// operation's success path means a bulk op that traps or fails is not billed
+/// for the work it never performed.
+#[must_use = "DeferredBulkFuel must be passed to post_translate_bulk_op"]
+struct DeferredBulkFuel {
+    /// The number of units (bytes/elements/pages) operated on.
+    units: DeferredBulkUnits,
+    /// The per-unit fuel cost.
+    cost_per_unit: u8,
 }
 
-/// The unit count carried by a [`DeferredBulkFuel::Charge`].
-///
-/// Distinguishes a compile-time-known count -- whose product with the per-unit
-/// cost is folded at translation time -- from a runtime `ir::Value` count,
-/// whose product is computed (saturating) at execution time.
 enum DeferredBulkUnits {
     /// A statically-known unit count, already clamped to `i64`.
     Const(i64),
