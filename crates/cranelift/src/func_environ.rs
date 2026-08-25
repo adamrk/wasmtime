@@ -2693,12 +2693,10 @@ impl FuncEnvironment<'_> {
         // Conditionally call that on growth success, and otherwise fall through
         // to continue to yield -1 for this growth operation.
         let current_block = builder.current_block().unwrap();
-        let failed_block = builder.create_block();
         let fill_block = builder.create_block();
         let done_block = builder.create_block();
 
-        builder.insert_block_after(failed_block, current_block);
-        builder.insert_block_after(fill_block, failed_block);
+        builder.insert_block_after(fill_block, current_block);
         builder.insert_block_after(done_block, fill_block);
 
         // Commit the operator's flat cost before branching so translating the
@@ -2708,14 +2706,7 @@ impl FuncEnvironment<'_> {
         }
         let failure = builder.ins().iconst(index_type_to_ir_type(index_type), -1);
         let failed = builder.ins().icmp(IntCC::Equal, result_idx, failure);
-        builder
-            .ins()
-            .brif(failed, failed_block, &[], fill_block, &[]);
-
-        // A failed attempt performs no initialization loop and is not charged
-        // the size-proportional growth fuel - only the flat per-operator cost.
-        builder.switch_to_block(failed_block);
-        builder.ins().jump(done_block, &[]);
+        builder.ins().brif(failed, done_block, &[], fill_block, &[]);
 
         builder.switch_to_block(fill_block);
         self.translate_entity_fill(
@@ -2728,12 +2719,18 @@ impl FuncEnvironment<'_> {
             init_value,
             delta,
         )?;
-        self.post_translate_bulk_op(builder, fuel)?;
+        if fuel.is_some() {
+            self.post_translate_bulk_op(builder, fuel)?;
+            // Flush possible fuel consumed before joining failure path.
+            if self.tunables.consume_fuel {
+                self.fuel_increment_var(builder);
+            }
+        }
+
         builder.ins().jump(done_block, &[]);
 
         builder.switch_to_block(done_block);
 
-        builder.seal_block(failed_block);
         builder.seal_block(fill_block);
         builder.seal_block(done_block);
 
@@ -3647,23 +3644,31 @@ impl FuncEnvironment<'_> {
         // actually succeeded.
         if fuel.is_some() {
             let current_block = builder.current_block().unwrap();
-            let charge_block = builder.create_block();
+            let success_block = builder.create_block();
             let done_block = builder.create_block();
-            builder.insert_block_after(charge_block, current_block);
-            builder.insert_block_after(done_block, charge_block);
+            builder.insert_block_after(success_block, current_block);
+            builder.insert_block_after(done_block, success_block);
 
+            // Flush existing fuel charges before branching.
+            if self.tunables.consume_fuel {
+                self.fuel_increment_var(builder);
+            }
             let failure = builder.ins().iconst(index_type_to_ir_type(index_type), -1);
             let failed = builder.ins().icmp(IntCC::Equal, grow_result, failure);
             builder
                 .ins()
-                .brif(failed, done_block, &[], charge_block, &[]);
+                .brif(failed, done_block, &[], success_block, &[]);
 
-            builder.switch_to_block(charge_block);
+            builder.switch_to_block(success_block);
             self.post_translate_bulk_op(builder, fuel)?;
+            // Flush possible fuel consumed before joining failure path.
+            if self.tunables.consume_fuel {
+                self.fuel_increment_var(builder);
+            }
             builder.ins().jump(done_block, &[]);
 
             builder.switch_to_block(done_block);
-            builder.seal_block(charge_block);
+            builder.seal_block(success_block);
             builder.seal_block(done_block);
         }
 
@@ -5165,16 +5170,12 @@ impl FuncEnvironment<'_> {
     }
 
     /// Emitted after a bulk operation has completed successfully, charging the
-    /// size-proportional fuel deferred by [`Self::pre_translate_bulk_op`] and
-    /// then performing a follow-up fuel/epoch check that accounts for the cost
-    /// the op just incurred.
+    /// size-proportional fuel deferred by [`Self::pre_translate_bulk_op`].
     ///
-    /// `builder` must be positioned on the operation's success continuation so
-    /// that the charge only runs when the op actually did its work. The charge
-    /// is emitted as runtime instructions into the current block (rather than
-    /// the compile-time `fuel_consumed` buffer) precisely so it stays on the
-    /// success path and does not leak into a later merge block that a failure
-    /// path also reaches.
+    /// Note: The charge is emitted as runtime code if the units are dynamic,
+    /// but otherwise only `self.fuel_consumed` is updated. This means a call to
+    /// `fuel_increment_var` may be required to prevent the charges leaking into
+    /// the "failure" branch.
     fn post_translate_bulk_op(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -5189,23 +5190,15 @@ impl FuncEnvironment<'_> {
         };
         debug_assert!(self.tunables.consume_fuel && cost_per_unit > 0);
 
-        // Flush any buffered flat cost first so the running counter is current,
-        // then add the variable cost.
-        //
-        // Note that fuel is always a 64-bit counter, and that the cost is
-        // clamped to `i64::MAX` to prevent fuel counter overflows since the
-        // number of units is otherwise an untrusted value.
-        self.fuel_increment_var(builder);
-        let fuel_var = builder.use_var(self.fuel_var);
-        let updated = match units {
-            // Constant size: fold the (saturated) product at compile time.
-            DeferredBulkUnits::Const(units) => builder
-                .ins()
-                .iadd_imm_s(fuel_var, units.saturating_mul(i64::from(cost_per_unit))),
-
-            // Dynamic size: compute `units * cost_per_unit` at runtime with
-            // saturation.
+        match units {
+            DeferredBulkUnits::Const(units) => {
+                self.fuel_consumed = self
+                    .fuel_consumed
+                    .saturating_add(units.saturating_mul(i64::from(cost_per_unit)))
+            }
             DeferredBulkUnits::Runtime(units) => {
+                self.fuel_increment_var(builder);
+                let fuel_var = builder.use_var(self.fuel_var);
                 let variable = match builder.func.dfg.value_type(units) {
                     ir::types::I32 => {
                         let units64 = builder.ins().uextend(ir::types::I64, units);
@@ -5225,21 +5218,10 @@ impl FuncEnvironment<'_> {
                     }
                     _ => unreachable!(),
                 };
-                builder.ins().iadd(fuel_var, variable)
+                let updated = builder.ins().iadd(fuel_var, variable);
+                builder.def_var(self.fuel_var, updated);
             }
         };
-        builder.def_var(self.fuel_var, updated);
-
-        // With the size-proportional cost now folded into the counter, perform
-        // a fuel/epoch check like a loop header would. The pre-op check in
-        // `pre_translate_bulk_op` already gated this op on the budget available
-        // before it ran; this second check additionally catches an op large
-        // enough to exhaust the budget on its own, billing it for the work it
-        // actually completed and then tripping the check on this success path.
-        //
-        // This isn't a loop header but for fuel/epoch purposes it's the same
-        // thing.
-        self.translate_loop_header(builder)?;
         Ok(())
     }
 
@@ -6251,8 +6233,6 @@ impl FuncEnvironment<'_> {
         let cost = self.tunables.operator_cost.variable().memory_init_per_byte;
         let fuel = self.pre_translate_bulk_op(builder, len, cost)?;
         self.translate_entity_copy(builder, memory, data, offset, start, len)?;
-        // Charge the size-proportional fuel on the copy's success path, before
-        // the merge below so a skipped (CoW) initialization isn't billed.
         self.post_translate_bulk_op(builder, fuel)?;
 
         // Finalize control-flow for the `MemorySegmentOffset::Static` case
