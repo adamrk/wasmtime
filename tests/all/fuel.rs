@@ -173,6 +173,280 @@ fn iloop(config: &mut Config) -> Result<()> {
             )
         "#,
     )?;
+    iloop_aborts(
+        &config,
+        r#"
+            (module
+                (memory 1)
+                (start 0)
+                (func
+                    i32.const 0
+                    i32.const 0
+                    i32.const 65536
+                    memory.copy
+                )
+            )
+        "#,
+    )?;
+
+    iloop_aborts(
+        &config,
+        r#"
+            (module
+                (memory 1)
+                (start 0)
+                (func
+                    i32.const 0
+                    i32.const 0
+                    i32.const 65536
+                    memory.fill
+                )
+            )
+        "#,
+    )?;
+
+    let data = "a".repeat(65536);
+    iloop_aborts(
+        &config,
+        &format!(
+            r#"
+            (module
+                (memory 1)
+                (start 0)
+                (func
+                    i32.const 0
+                    i32.const 0
+                    i32.const 65536
+                    memory.init $d
+                )
+
+                (data $d "{data}")
+            )
+            "#
+        ),
+    )?;
+
+    iloop_aborts(
+        &config,
+        r#"
+            (module
+                (table 20000 funcref)
+                (start 0)
+                (func
+                    i32.const 0
+                    i32.const 0
+                    i32.const 20000
+                    table.copy
+                )
+            )
+        "#,
+    )?;
+
+    iloop_aborts(
+        &config,
+        r#"
+            (module
+                (table 20000 funcref)
+                (start 0)
+                (func
+                    i32.const 0
+                    ref.null func
+                    i32.const 20000
+                    table.fill
+                )
+            )
+        "#,
+    )?;
+
+    iloop_aborts(
+        &config,
+        r#"
+            (module
+                (table 0 funcref)
+                (start 0)
+                (func
+                    ref.null func
+                    i32.const 20000
+                    table.grow
+                    drop
+                )
+            )
+        "#,
+    )?;
+
+    let elems = "$f ".repeat(20000);
+    iloop_aborts(
+        &config,
+        &format!(
+            r#"
+            (module
+                (table 20000 funcref)
+                (start 0)
+                (func
+                    i32.const 0
+                    i32.const 0
+                    i32.const 20000
+                    table.init $e
+                )
+                (func $f)
+                (elem $e func {elems})
+            )
+            "#
+        ),
+    )?;
+
+    iloop_aborts(
+        &config,
+        r#"
+            (module
+                (type $a (array i8))
+                (start 0)
+                (func
+                    i32.const 2_0000
+                    array.new_default $a
+                    drop
+                )
+            )
+        "#,
+    )?;
+
+    iloop_aborts(
+        &config,
+        r#"
+            (module
+                (type $a (array (mut i8)))
+                (start 0)
+                (global $a (ref $a) i32.const 20000 array.new_default $a)
+                (global $b (ref $a) i32.const 20000 array.new_default $a)
+                (func
+                    global.get $a
+                    i32.const 0
+                    global.get $b
+                    i32.const 0
+                    i32.const 20000
+                    array.copy $a $a
+                )
+            )
+        "#,
+    )?;
+
+    iloop_aborts(
+        &config,
+        r#"
+            (module
+                (type $a (array (mut i8)))
+                (start 0)
+                (global $a (ref $a) i32.const 20000 array.new_default $a)
+                (func
+                    global.get $a
+                    i32.const 0
+                    i32.const 0
+                    i32.const 20000
+                    array.fill $a
+                )
+            )
+        "#,
+    )?;
+
+    iloop_aborts(
+        &config,
+        &format!(
+            r#"
+            (module
+                (type $a (array (mut i8)))
+                (start 0)
+                (func
+                    i32.const 0
+                    i32.const 65536
+                    array.new_data $a $d
+                    drop
+                )
+
+                (data $d "{data}")
+            )
+            "#
+        ),
+    )?;
+
+    iloop_aborts(
+        &config,
+        &format!(
+            r#"
+            (module
+                (type $a (array (mut i8)))
+                (start 0)
+                (global $a (ref $a) i32.const 20000 array.new_default $a)
+                (func
+                    global.get $a
+                    i32.const 0
+                    i32.const 0
+                    i32.const 20000
+                    array.init_data $a $d
+                )
+
+                (data $d "{data}")
+            )
+            "#
+        ),
+    )?;
+
+    iloop_aborts(
+        &config,
+        &format!(
+            r#"
+            (module
+                (type $a (array (mut funcref)))
+                (start 0)
+                (func
+                    i32.const 0
+                    i32.const 20000
+                    array.new_elem $a $e
+                    drop
+                )
+                (func $f)
+                (elem $e func {elems})
+            )
+            "#
+        ),
+    )?;
+
+    iloop_aborts(
+        &config,
+        &format!(
+            r#"
+            (module
+                (type $a (array (mut funcref)))
+                (start 0)
+                (global $a (ref $a) i32.const 20000 array.new_default $a)
+                (func
+                    global.get $a
+                    i32.const 0
+                    i32.const 0
+                    i32.const 20000
+                    array.init_elem $a $e
+                )
+                (func $f)
+                (elem $e func {elems})
+            )
+            "#
+        ),
+    )?;
+
+    iloop_aborts(
+        &config,
+        r#"
+            (module
+                (type $a (array (mut i8)))
+                (start 0)
+                (func
+                    i32.const 0
+                    i32.const 20000
+                    array.new $a
+                    drop
+                )
+            )
+        "#,
+    )?;
 
     fn iloop_aborts(config: &Config, wat: &str) -> Result<()> {
         log::debug!("Testing infinite loop:\n{wat}");
@@ -559,9 +833,9 @@ const COST_TABLE_GROW_PER_ELEMENT: u64 = 19;
 const COST_MEMORY_GROW: u64 = 2;
 const COST_TABLE_GROW: u64 = 3;
 
-/// Try running a module where we attempt to grow a table and memory by
+/// Try running a module where we attempt to grow a table and memory by a const
 /// `grow_by` (which fails) and return the fuel consumed.
-fn failed_growth_fuel_consumed(config: &mut Config, grow_by: u32) -> Result<u64> {
+fn failed_const_growth_fuel_consumed(config: &mut Config, grow_by: u32) -> Result<u64> {
     config.consume_fuel(true);
     let op_cost = OperatorCost {
         I32Const: 0,
@@ -604,8 +878,8 @@ fn failed_growth_fuel_consumed(config: &mut Config, grow_by: u32) -> Result<u64>
 // Checks that small constant grows consume fuel immediately, even if they fail.
 #[wasmtime_test(wasm_features(reference_types), strategies(not(Winch)))]
 #[cfg_attr(miri, ignore)]
-fn variable_operator_cost_failed_small_growth(config: &mut Config) -> Result<()> {
-    let consumed = failed_growth_fuel_consumed(config, 5)?;
+fn failed_const_small_growth_fuel_consumed(config: &mut Config) -> Result<()> {
+    let consumed = failed_const_growth_fuel_consumed(config, 5)?;
     assert_eq!(
         consumed,
         5 * COST_MEMORY_GROW_PER_PAGE
@@ -622,8 +896,8 @@ fn variable_operator_cost_failed_small_growth(config: &mut Config) -> Result<()>
 // consume fixed fuel costs if they fail.
 #[wasmtime_test(wasm_features(reference_types), strategies(not(Winch)))]
 #[cfg_attr(miri, ignore)]
-fn variable_operator_cost_failed_growth_deferred(config: &mut Config) -> Result<()> {
-    let consumed = failed_growth_fuel_consumed(config, 200)?;
+fn failed_const_large_growth_fuel_deferred(config: &mut Config) -> Result<()> {
+    let consumed = failed_const_growth_fuel_consumed(config, 200)?;
     assert_eq!(consumed, 1 + COST_MEMORY_GROW + COST_TABLE_GROW);
 
     Ok(())
@@ -703,10 +977,6 @@ fn variable_operator_cost_charged_only_on_success(config: &mut Config) -> Result
         instance.get_typed_func::<(i32, i32), ()>(&mut store, "fill")?
     };
 
-    // The length is a runtime value, so the per-byte cost takes the deferred
-    // path (charged after the fill succeeds) rather than the small-constant
-    // fast path.
-
     // In-bounds fill of 1000 bytes: billed 1000 * 3 on the success path, plus
     // the single baseline unit.
     store.set_fuel(1_000_000)?;
@@ -714,10 +984,7 @@ fn variable_operator_cost_charged_only_on_success(config: &mut Config) -> Result
     fill.call(&mut store, (0, 1000))?;
     assert_eq!(initial_fuel - store.get_fuel()?, 1000 * 3 + 1);
 
-    // Out-of-bounds fill of 1000 bytes (dst 65_000 + 1000 exceeds the
-    // 65_536-byte memory): the op traps during bounds validation, before the
-    // deferred per-byte charge runs. As with any trap the pending fuel is
-    // discarded, so the counter is left untouched.
+    // Out-of-bounds fill isn't charged.
     store.set_fuel(1_000_000)?;
     let initial_fuel = store.get_fuel()?;
     let error = fill.call(&mut store, (65_000, 1000)).unwrap_err();
@@ -729,7 +996,7 @@ fn variable_operator_cost_charged_only_on_success(config: &mut Config) -> Result
 
 #[wasmtime_test(strategies(not(Winch)))]
 #[cfg_attr(miri, ignore)]
-fn memory_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
+fn runtime_memory_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
     config.consume_fuel(true);
     let op_cost = OperatorCost {
         LocalGet: 0,
@@ -757,18 +1024,13 @@ fn memory_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
         instance.get_typed_func::<i32, i32>(&mut store, "grow")?
     };
 
-    // A dynamic (non-constant) delta keeps the op off the small-constant fast
-    // path, so the per-page cost is deferred to the success continuation.
-
-    // Successful grow (0 -> 50 pages, under the max of 100): billed 50 * 2 plus
-    // the single baseline unit.
+    // Successful grow consumes variable and fixed fuel.
     store.set_fuel(1_000_000)?;
     let initial_fuel = store.get_fuel()?;
     assert_eq!(grow.call(&mut store, 50)?, 0);
     assert_eq!(initial_fuel - store.get_fuel()?, 50 * 2 + 1);
 
-    // Failed grow (50 + 60 exceeds the max of 100): returns -1 without trapping
-    // and is billed only the baseline unit -- never the deferred per-page cost.
+    // Failed grow only consumes fixed fuel.
     store.set_fuel(1_000_000)?;
     let initial_fuel = store.get_fuel()?;
     assert_eq!(grow.call(&mut store, 60)?, -1);
@@ -779,7 +1041,7 @@ fn memory_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
 
 #[wasmtime_test(wasm_features(reference_types), strategies(not(Winch)))]
 #[cfg_attr(miri, ignore)]
-fn table_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
+fn runtime_table_grow_charged_only_on_success(config: &mut Config) -> Result<()> {
     config.consume_fuel(true);
     let op_cost = OperatorCost {
         RefNull: 0,

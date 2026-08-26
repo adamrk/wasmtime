@@ -5119,7 +5119,8 @@ impl FuncEnvironment<'_> {
     /// If fuel is enabled, it'll calculate and return how much fuel should be
     /// consumed if the operation succeeds. The return value should be used by
     /// `post_translate_bulk_op` to consume the fuel _after_ the operation has
-    /// succeeded to prevent turning OOB traps into out-of-fuel traps.
+    /// succeeded to prevent turning OOB traps or grow failures into out-of-fuel
+    /// traps.
     ///
     /// If fuel or epochs are enabled then a fuel/epoch check will occur.
     ///
@@ -5133,9 +5134,10 @@ impl FuncEnvironment<'_> {
         units: ir::Value,
         cost_per_unit: u8,
     ) -> WasmResult<Option<DeferredBulkFuel>> {
+        let should_consume_fuel = self.tunables.consume_fuel && cost_per_unit > 0;
+
         let const_units =
             Self::value_as_const_int(builder, units).map(|c| i64::try_from(c).unwrap_or(i64::MAX));
-        let should_consume_fuel = self.tunables.consume_fuel && cost_per_unit > 0;
 
         // Skip explicit fuel/epoch checks for operations which are
         // subjectively, and statically, considered cheap and consume the fuel
@@ -5153,29 +5155,28 @@ impl FuncEnvironment<'_> {
 
         // This isn't a loop header but for fuel/epoch purposes it's the same
         // thing.
-        self.translate_loop_header(builder)?;
+        self.translate_loop_header(builder);
 
-        let deferred_charge = if should_consume_fuel {
-            Some(DeferredBulkFuel {
+        if should_consume_fuel {
+            Ok(Some(DeferredBulkFuel {
                 units: match const_units {
                     Some(const_units) => DeferredBulkUnits::Const(const_units),
                     None => DeferredBulkUnits::Runtime(units),
                 },
                 cost_per_unit,
-            })
+            }))
         } else {
-            None
-        };
-        Ok(deferred_charge)
+            Ok(None)
+        }
     }
 
-    /// Emitted after a bulk operation has completed successfully, charging the
+    /// Emitted after a bulk operation has completed successfully, consuming the
     /// size-proportional fuel deferred by [`Self::pre_translate_bulk_op`].
     ///
-    /// Note: The charge is emitted as runtime code if the units are dynamic,
-    /// but otherwise only `self.fuel_consumed` is updated. This means a call to
-    /// `fuel_increment_var` may be required to prevent the charges leaking into
-    /// the "failure" branch.
+    /// Note: The fuel adjustment emitted as runtime code if the units are
+    /// dynamic, but otherwise only `self.fuel_consumed` is updated. This means
+    /// a call to `fuel_increment_var` may be required to prevent the charges
+    /// leaking into the "failure" branch.
     fn post_translate_bulk_op(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -5225,7 +5226,7 @@ impl FuncEnvironment<'_> {
         Ok(())
     }
 
-    pub fn translate_loop_header(&mut self, builder: &mut FunctionBuilder) -> WasmResult<()> {
+    pub fn translate_loop_header(&mut self, builder: &mut FunctionBuilder) {
         // Additionally if enabled check how much fuel we have remaining to see
         // if we've run out by this point.
         if self.tunables.consume_fuel {
@@ -5237,8 +5238,6 @@ impl FuncEnvironment<'_> {
         if self.tunables.epoch_interruption {
             self.epoch_check(builder);
         }
-
-        Ok(())
     }
 
     pub fn before_translate_operator(

@@ -825,8 +825,6 @@ pub fn translate_array_new(
         elem,
         len,
     )?;
-    // Allocation and fill succeeded: charge the deferred size-proportional
-    // fuel.
     func_env.post_translate_bulk_op(builder, fuel)?;
     log::trace!("translate_array_new(..) -> {result:?}");
     Ok(result)
