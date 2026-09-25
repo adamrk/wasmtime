@@ -1,0 +1,14 @@
+[package]
+name = "wasmtime-samply-middleware"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+wasip2 = "1.0.4"
+
+[lib]
+crate-type = ["cdylib"]
+
+# Keep this profiling fixture independent of Wasmtime's main Cargo workspace.
+[workspace]
