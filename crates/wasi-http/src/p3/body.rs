@@ -9,15 +9,17 @@ use core::pin::Pin;
 use core::task::{Context, Poll, ready};
 use http::HeaderMap;
 use http_body::Body as _;
+use http_body_util::BodyExt as _;
 use http_body_util::combinators::UnsyncBoxBody;
 use std::any::{Any, TypeId};
 use std::mem;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::PollSender;
 use wasmtime::component::{
-    Destination, FutureReader, Resource, Source, StreamConsumer, StreamProducer, StreamReader,
-    StreamResult,
+    Destination, FutureProducer, FutureReader, Resource, Source, StreamConsumer, StreamProducer,
+    StreamReader, StreamResult,
 };
 use wasmtime::error::Context as _;
 use wasmtime::{AsContextMut, StoreContextMut};
@@ -61,9 +63,9 @@ async fn guest_body_result<E>(
 impl Body {
     pub(crate) fn new_guest<S>(
         mut store: S,
-        mut getter: impl FnMut(&mut S::Data) -> WasiHttpCtxView<'_> + Send + 'static,
+        mut getter: impl FnMut(&mut S::Data) -> WasiHttpCtxView<'_> + Copy + Unpin + Send + 'static,
         contents: Option<StreamReader<u8>>,
-        mut trailers: FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
+        trailers: FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
     ) -> wasmtime::Result<(Self, FutureReader<Result<(), ErrorCode>>)>
     where
         S: AsContextMut,
@@ -74,12 +76,36 @@ impl Body {
             .map(|rx| rx.try_into::<HostBodyStreamProducer>(store.as_context_mut()))
         {
             Some(Ok(mut producer)) => {
-                trailers.close(store.as_context_mut())?;
-                let (result_tx, result_rx) = oneshot::channel();
-                let body = Body::Host {
-                    body: mem::take(&mut producer.body),
-                    result_tx,
+                let body = mem::take(&mut producer.body);
+                // If the guest handed back the trailers belonging to this
+                // body then they'll be yielded by `body` itself. Otherwise the
+                // trailers of `body` must be replaced by the ones the guest
+                // provided.
+                let body = match trailers.try_into::<HostTrailers>(store.as_context_mut()) {
+                    Ok(trailers) if trailers.id == producer.trailers_id => body,
+                    Ok(trailers) => body.with_replaced_trailers(trailers.rx).boxed_unsync(),
+                    Err(trailers) => {
+                        let (trailers_tx, trailers_rx) = oneshot::channel();
+                        trailers.pipe_cb(store.as_context_mut(), move |data, res| {
+                            let res = match res {
+                                Ok(Some(trailers)) => {
+                                    let trailers = getter(data)
+                                        .table
+                                        .delete(trailers)
+                                        .context("failed to delete trailers")?;
+                                    Ok(Some(trailers.into()))
+                                }
+                                Ok(None) => Ok(None),
+                                Err(err) => Err(Error::from(err)),
+                            };
+                            _ = trailers_tx.send(res);
+                            Ok(())
+                        })?;
+                        body.with_replaced_trailers(trailers_rx).boxed_unsync()
+                    }
                 };
+                let (result_tx, result_rx) = oneshot::channel();
+                let body = Body::Host { body, result_tx };
                 return Ok((
                     body,
                     FutureReader::new_cb(
@@ -115,7 +141,7 @@ impl Body {
         self,
         mut store: S,
         fut: FutureReader<Result<(), ErrorCode>>,
-        mut getter: impl FnMut(&mut S::Data) -> WasiHttpCtxView<'_> + Send + 'static,
+        getter: impl FnMut(&mut S::Data) -> WasiHttpCtxView<'_> + Send + 'static,
     ) -> wasmtime::Result<(
         StreamReader<u8>,
         FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
@@ -145,28 +171,26 @@ impl Body {
                     Ok(())
                 })?;
                 let (trailers_tx, trailers_rx) = oneshot::channel();
+                let trailers_id = NEXT_HOST_TRAILERS_ID.fetch_add(1, Ordering::Relaxed);
                 (
                     StreamReader::new(
                         store.as_context_mut(),
                         HostBodyStreamProducer {
                             body,
                             trailers: Some(trailers_tx),
+                            trailers_id,
                         },
                     )?,
-                    FutureReader::new_cb(store.as_context_mut(), trailers_rx, move |d, res| {
-                        let mut view = getter(d);
-                        let trailers = match res {
-                            Ok(Some(trailers)) => trailers,
-                            Ok(None) => return Ok(Ok(None)),
-                            Err(e) => return Ok(Err(view.error_to_p3(&e))),
-                        };
-                        let trailers = FieldMap::new_immutable(view.hooks, trailers);
-                        let trailers = view
-                            .table
-                            .push(trailers)
-                            .context("failed to push trailers to table")?;
-                        Ok(Ok(Some(trailers)))
-                    })?,
+                    FutureReader::new(
+                        store.as_context_mut(),
+                        HostTrailersProducer {
+                            trailers: HostTrailers {
+                                id: trailers_id,
+                                rx: trailers_rx,
+                            },
+                            getter,
+                        },
+                    )?,
                 )
             }
         };
@@ -499,6 +523,68 @@ impl http_body::Body for GuestBody {
 pub(crate) struct HostBodyStreamProducer {
     pub(crate) body: UnsyncBoxBody<Bytes, Error>,
     trailers: Option<oneshot::Sender<Result<Option<HeaderMap>, Error>>>,
+    /// The [HostTrailers::id] of the trailers corresponding to `body`
+    trailers_id: u64,
+}
+
+/// Source of unique [HostTrailers::id] values
+static NEXT_HOST_TRAILERS_ID: AtomicU64 = AtomicU64::new(0);
+
+/// The trailers of a body originating in the host.
+pub(crate) struct HostTrailers {
+    /// Identifies the [HostBodyStreamProducer] these trailers belong to
+    id: u64,
+    rx: oneshot::Receiver<Result<Option<HeaderMap>, Error>>,
+}
+
+/// [FutureProducer] implementation for trailers of bodies originating in the host.
+struct HostTrailersProducer<G> {
+    trailers: HostTrailers,
+    getter: G,
+}
+
+// `getter` is never pinned
+impl<G> Unpin for HostTrailersProducer<G> {}
+
+impl<D, G> FutureProducer<D> for HostTrailersProducer<G>
+where
+    G: FnMut(&mut D) -> WasiHttpCtxView<'_> + Send + 'static,
+{
+    type Item = Result<Option<Resource<Trailers>>, ErrorCode>;
+
+    fn poll_produce(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut store: StoreContextMut<D>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<Option<Self::Item>>> {
+        let res = match Pin::new(&mut self.trailers.rx).poll(cx) {
+            Poll::Ready(res) => res,
+            Poll::Pending if finish => return Poll::Ready(Ok(None)),
+            Poll::Pending => return Poll::Pending,
+        };
+        let mut view = (self.getter)(store.data_mut());
+        let trailers = match res {
+            Ok(Ok(Some(trailers))) => trailers,
+            // sender dropped, treat as no trailers
+            Ok(Ok(None)) | Err(..) => return Poll::Ready(Ok(Some(Ok(None)))),
+            Ok(Err(e)) => return Poll::Ready(Ok(Some(Err(view.error_to_p3(&e))))),
+        };
+        let trailers = FieldMap::new_immutable(view.hooks, trailers);
+        let trailers = view
+            .table
+            .push(trailers)
+            .context("failed to push trailers to table")?;
+        Poll::Ready(Ok(Some(Ok(Some(trailers)))))
+    }
+
+    fn try_into(me: Pin<Box<Self>>, ty: TypeId) -> Result<Box<dyn Any>, Pin<Box<Self>>> {
+        if ty == TypeId::of::<HostTrailers>() {
+            Ok(Box::new(Pin::into_inner(me).trailers))
+        } else {
+            Err(me)
+        }
+    }
 }
 
 impl Drop for HostBodyStreamProducer {
@@ -657,6 +743,58 @@ where
             res.set_upper(upper + n);
         }
         res
+    }
+}
+
+/// A wrapper around [http_body::Body], which replaces its trailers with the ones
+/// received on `trailers`
+pub(crate) struct BodyWithReplacedTrailers<T> {
+    body: T,
+    body_done: bool,
+    trailers: Option<oneshot::Receiver<Result<Option<HeaderMap>, Error>>>,
+}
+
+impl<T> http_body::Body for BodyWithReplacedTrailers<T>
+where
+    T: http_body::Body<Data = Bytes, Error = Error> + Unpin,
+{
+    type Data = Bytes;
+    type Error = Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        while !this.body_done {
+            match ready!(Pin::new(&mut this.body).poll_frame(cx)) {
+                Some(Ok(frame)) if frame.is_data() => return Poll::Ready(Some(Ok(frame))),
+                // discard the original trailers
+                Some(Ok(..)) => {}
+                Some(Err(err)) => return Poll::Ready(Some(Err(err))),
+                None => this.body_done = true,
+            }
+        }
+
+        let Some(trailers) = this.trailers.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let res = ready!(Pin::new(trailers).poll(cx));
+        this.trailers = None;
+        match res {
+            Ok(Ok(Some(trailers))) => Poll::Ready(Some(Ok(http_body::Frame::trailers(trailers)))),
+            // sender dropped, treat as no trailers
+            Ok(Ok(None)) | Err(..) => Poll::Ready(None),
+            Ok(Err(err)) => Poll::Ready(Some(Err(err))),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body_done && self.trailers.is_none()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
     }
 }
 
@@ -822,6 +960,20 @@ pub(crate) trait BodyExt {
         BodyWithFilteredTrailers {
             body: self,
             is_forbidden,
+        }
+    }
+
+    fn with_replaced_trailers(
+        self,
+        trailers: oneshot::Receiver<Result<Option<HeaderMap>, Error>>,
+    ) -> BodyWithReplacedTrailers<Self>
+    where
+        Self: Sized,
+    {
+        BodyWithReplacedTrailers {
+            body: self,
+            body_done: false,
+            trailers: Some(trailers),
         }
     }
 

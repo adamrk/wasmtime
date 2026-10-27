@@ -215,7 +215,7 @@ impl HostFields for WasiHttpCtxView<'_> {
 
 fn new_request<S>(
     mut store: S,
-    mut getter: impl FnMut(&mut S::Data) -> WasiHttpCtxView<'_> + Copy + Send + 'static,
+    mut getter: impl FnMut(&mut S::Data) -> WasiHttpCtxView<'_> + Copy + Unpin + Send + 'static,
     headers: Resource<Headers>,
     contents: Option<StreamReader<u8>>,
     trailers: FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
@@ -488,7 +488,7 @@ impl HostRequestOptions for WasiHttpCtxView<'_> {
 
 fn new_response<S>(
     mut store: S,
-    mut getter: impl FnMut(&mut S::Data) -> WasiHttpCtxView<'_> + Copy + Send + 'static,
+    mut getter: impl FnMut(&mut S::Data) -> WasiHttpCtxView<'_> + Copy + Unpin + Send + 'static,
     headers: Resource<Headers>,
     contents: Option<StreamReader<u8>>,
     trailers: FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,

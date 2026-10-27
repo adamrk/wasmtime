@@ -1263,38 +1263,64 @@ async fn p3_http_named_imports() -> Result<()> {
 mod p3_http_forward_body {
     use super::*;
 
-    async fn forward(mode: &str) -> Result<Bytes> {
+    /// Forwards a request body, which has the trailer `x-host: host`, through
+    /// the guest and returns the collected response body.
+    async fn forward(mode: &str) -> Result<Collected<Bytes>> {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-host", http::HeaderValue::from_static("host"));
         let req = http::Request::builder()
             .uri("http://localhost/")
             .header("x-mode", mode)
-            .body(http_body_util::Full::new(Bytes::from_static(
-                b"hello world",
-            )))?;
+            .body(
+                http_body_util::Full::new(Bytes::from_static(b"hello world"))
+                    .with_trailers(std::future::ready(Some(Ok(trailers)))),
+            )?;
         let res = run_http(P3_HTTP_FORWARD_BODY_COMPONENT, req, oneshot::channel().0)
             .await?
             .unwrap();
-        Ok(res.into_body().to_bytes())
+        Ok(res.into_body())
+    }
+
+    fn trailer_names(body: &Collected<Bytes>) -> Vec<&str> {
+        let mut names = body
+            .trailers()
+            .map(|t| t.keys().map(|k| k.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        names.sort();
+        names
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn read_0() -> Result<()> {
-        assert_eq!(forward("read-0").await?, "hello world");
+        let body = forward("read-0").await?;
+        assert_eq!(trailer_names(&body), ["x-host"]);
+        assert_eq!(body.to_bytes(), "hello world");
         Ok(())
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn read_1() -> Result<()> {
-        assert_eq!(forward("read-1").await?, "ello world");
+        let body = forward("read-1").await?;
+        assert_eq!(trailer_names(&body), ["x-host"]);
+        assert_eq!(body.to_bytes(), "ello world");
         Ok(())
     }
 
-    /// Enable when https://github.com/bytecodealliance/wasmtime/issues/15026
-    /// has been fixed.
-    #[ignore]
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn trailers_error() -> Result<()> {
         let res = forward("trailers-error").await;
         assert!(res.is_err(), "{res:?}");
+        Ok(())
+    }
+
+    /// The guest's trailers must replace, not be merged with, the host's.
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn trailers_replace() -> Result<()> {
+        let body = forward("trailers-replace").await?;
+        assert_eq!(trailer_names(&body), ["x-guest"]);
+        let trailers = body.trailers().unwrap();
+        assert_eq!(trailers["x-guest"], "guest");
+        assert_eq!(body.to_bytes(), "hello world");
         Ok(())
     }
 }

@@ -1,6 +1,6 @@
 use test_programs::p3::{
     service::exports::wasi::http::handler::Guest as Handler,
-    wasi::http::types::{ErrorCode, Fields, Request, Response},
+    wasi::http::types::{ErrorCode, Fields, Request, Response, Trailers},
     wit_future,
 };
 
@@ -23,6 +23,14 @@ impl Handler for Component {
             b"read-1" => _ = body.read(Vec::with_capacity(1)).await,
             b"trailers-error" => {
                 trailers = wit_future::new(|| Err(ErrorCode::InternalError(None))).1;
+            }
+            b"trailers-replace" => {
+                let (tx, rx) = wit_future::new(|| Ok(None));
+                trailers = rx;
+                wit_bindgen::spawn_local(async move {
+                    let fields = Trailers::from_list(&[("x-guest".into(), b"guest".into())]);
+                    _ = tx.write(Ok(Some(fields.unwrap()))).await;
+                });
             }
             _ => {}
         }

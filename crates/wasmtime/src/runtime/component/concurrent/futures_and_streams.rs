@@ -1203,6 +1203,18 @@ pub trait FutureProducer<D>: Send + 'static {
         store: StoreContextMut<D>,
         finish: bool,
     ) -> Poll<Result<Option<Self::Item>>>;
+
+    /// Attempt to convert the specified object into a `Box<dyn Any>` which may
+    /// be downcast to the specified type.
+    ///
+    /// This is equivalent to `StreamProducer::try_into`, but for futures. It
+    /// is only called if this producer has not yet produced a value.
+    ///
+    /// The implementation must ensure that, if it returns `Ok(_)`, a downcast
+    /// to the specified type is guaranteed to succeed.
+    fn try_into(me: Pin<Box<Self>>, _ty: TypeId) -> Result<Box<dyn Any>, Pin<Box<Self>>> {
+        Err(me)
+    }
 }
 
 impl<T, E, D, Fut> FutureProducer<D> for Fut
@@ -1284,6 +1296,10 @@ impl<T> FutureReader<T> {
             "concurrency support is not enabled"
         );
 
+        // Note that this is `repr(transparent)` so that `try_into` below can
+        // convert between `Pin<Box<Producer<P>>>` and `Pin<Box<P>>` without
+        // moving the pinned producer.
+        #[repr(transparent)]
         struct Producer<P>(P);
 
         impl<D, T: func::Lower + 'static, P: FutureProducer<D, Item = T>> StreamProducer<D>
@@ -1318,6 +1334,35 @@ impl<T> FutureReader<T> {
                         StreamResult::Cancelled
                     },
                 ))
+            }
+
+            fn try_into(
+                me: Pin<Box<Self>>,
+                buffer: Self::Buffer,
+                ty: TypeId,
+            ) -> Result<Box<dyn Any>, (Pin<Box<Self>>, Self::Buffer)> {
+                // If a value has already been produced then the future is
+                // effectively complete, so there's nothing to convert.
+                if buffer.is_some() {
+                    return Err((me, buffer));
+                }
+                // SAFETY: `Producer` is `repr(transparent)` over `P`, so the
+                // pointer casts below preserve both the allocation and the
+                // address of the pinned value, upholding the pin invariants.
+                let inner = unsafe {
+                    Pin::new_unchecked(Box::from_raw(
+                        Box::into_raw(Pin::into_inner_unchecked(me)).cast::<P>(),
+                    ))
+                };
+                P::try_into(inner, ty).map_err(|inner| {
+                    // SAFETY: see above.
+                    let me = unsafe {
+                        Pin::new_unchecked(Box::from_raw(
+                            Box::into_raw(Pin::into_inner_unchecked(inner)).cast::<Self>(),
+                        ))
+                    };
+                    (me, buffer)
+                })
             }
         }
 
@@ -1421,6 +1466,45 @@ impl<T> FutureReader<T> {
     /// Convenience method around [`Self::close`].
     pub fn close_with(&mut self, accessor: impl AsAccessor) -> Result<()> {
         accessor.as_accessor().with(|access| self.close(access))
+    }
+
+    /// Attempt to consume this object by converting it into the specified type.
+    ///
+    /// This is the future equivalent of [`StreamReader::try_into`] and can be
+    /// used to detect, for example, that a guest has handed back a future
+    /// which was originally created by the host.
+    ///
+    /// This will return `Ok(_)` if and only if the following conditions are
+    /// met:
+    ///
+    /// - The future was created by the host (i.e. not by the guest).
+    ///
+    /// - The future has not yet produced a value.
+    ///
+    /// - The `FutureProducer::try_into` function returns `Ok(_)` when given
+    /// the producer provided to `FutureReader::new` when the future was
+    /// created, along with `TypeId::of::<V>()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this future has already been closed, or if this future
+    /// doesn't belong to the specified `store`.
+    pub fn try_into<V: 'static>(mut self, mut store: impl AsContextMut) -> Result<V, Self> {
+        let store = store.as_context_mut();
+        let id = store.0.host_reader_rep(self.idx).unwrap();
+        let state = store.0.concurrent_state_mut_already_forced_current_thread();
+        let id = state.get_mut(id).unwrap().state;
+        if let WriteState::HostReady { try_into, .. } = &state.get_mut(id).unwrap().write {
+            match try_into(TypeId::of::<V>()) {
+                Some(result) => {
+                    self.close(store).unwrap();
+                    Ok(*result.downcast::<V>().unwrap())
+                }
+                None => Err(self),
+            }
+        } else {
+            Err(self)
+        }
     }
 
     /// Returns a [`GuardedFutureReader`] which will auto-close this future on
